@@ -101,6 +101,37 @@ function debian10_pkgs
     fi
 }
 
+function debian12_pkgs
+{
+    ## Debian 12
+    apt update -y
+    apt install -y wget \
+                   curl \
+    	           git \
+    	           sed \
+                   gawk \
+                   unzip \
+                   make \
+                   gcc \
+                   tree \
+    	           mariadb-server \
+                   mariadb-client  \
+                   libmariadb-dev \
+                   libmariadb-dev-compat \
+                   openjdk-17-jdk \
+                   ant \
+                   jsvc \
+                   chrony 
+    
+    ln -sf "$(which mariadb_config)" /usr/bin/mysql_config
+    # MySQL-python-1.2.5 doesn't work with mariadb 
+    # https://lists.launchpad.net/maria-developers/msg10744.html
+    # https://github.com/DefectDojo/django-DefectDojo/issues/407
+
+    if [ ! -f /usr/include/mariadb/mysql.h.bkp ]; then
+        sed '/st_mysql_options options;/a unsigned int reconnect;' /usr/include/mariadb/mysql.h -i.bkp
+    fi
+}
 
 function debian11_pkgs
 {
@@ -221,6 +252,7 @@ dist="$(find_dist)"
 echo "$dist"
 
 case "$dist" in
+    *bookworm*) debian12_pkgs ;;
     *buster*)   debian10_pkgs ;;
     *bullseye*) debian11_pkgs ;;
     *CentOS* | *Scientific* ) 
