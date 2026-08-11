@@ -18,6 +18,64 @@ This repository provides a set of `Makefiles` and scripts to automate the setup 
     * Sphinx documentation (`build_docs.sh`) is primarily for Linux.
 * **Sphinx Tools**: If building Sphinx documentation (which is enabled by default), ensure Sphinx, Python, and any necessary themes/extensions are installed and configured.
 
+## Automated Installation : `install_aa.sh`
+
+`install_aa.sh` performs the whole manual procedure documented below (and in `docs/README.rocky8.md`) automatically, on both the **Debian** (Debian 11/12/13, Ubuntu) and the **Rocky / RHEL** (Rocky, AlmaLinux, RHEL, CentOS Stream 8/9/10) families. The script only generates the `configure/*.local` files and drives the existing `make` rules, so nothing is hidden from the usual workflow.
+
+```bash
+# Full installation with the repository defaults
+./install_aa.sh
+
+# See what would be done, without touching the system
+./install_aa.sh --dry-run
+
+# Unattended installation, own storage location and DB password
+./install_aa.sh -y --storage=/home/archappl --db-pass='S3cret!'
+
+# Where is everything, what is installed, is it running ?
+./install_aa.sh paths
+./install_aa.sh exist
+./install_aa.sh status
+
+# Only rebuild and redeploy
+./install_aa.sh build install service
+
+# Remove the appliance and its systemd unit
+./install_aa.sh uninstall
+
+# Every example, grouped by purpose
+./install_aa.sh --help
+```
+
+The installation is split into stages, which can also be run one by one:
+
+| Stage | make rules behind it |
+| :--- | :--- |
+| `pkgs`    | the package list of `scripts/required_pkgs.sh`, per distribution |
+| `java`    | JDK 21+ (distribution package or Eclipse Temurin tarball) and Apache Maven, then `configure/*.local` |
+| `src`     | `init` (clone and `pom`) |
+| `db`      | `db.conf`, `db.secure`, `db.addAdmin`, `db.create`, `sql.fill` |
+| `tomcat`  | `tomcat.get`, `tomcat.install` |
+| `build`   | `build` (or `conf` + `build.mvn2` with `--skip-docs`) |
+| `install` | `install` (services, systemd unit, `sd_enable`) |
+| `service` | `systemctl restart $(SYSTEMD_FILENAME)` |
+| `verify`  | waits for `http://localhost:17665/mgmt/ui/index.html`, then prints a summary |
+
+Three more stages are never part of a default run and need no `sudo` at all : `paths` (every path and setting in use), `exist` (what is installed and what is still missing, with the command which fixes it) and `status` (systemd and appliance service status). `uninstall` removes the appliance and its systemd unit.
+
+The stage order matters : `src` comes before `db` because `sql.fill` fills the tables from `archappl_mysql.sql`, which lives in the appliance source tree.
+
+Notes
+
+* Run it as a normal user owning `sudo` rights, **not** as `root`, because the make rules call `sudo` themselves.
+* The values which are not given on the command line are read back from the current `make` configuration, so a partial run (`./install_aa.sh build`) never resets a previous customization.
+* The default storage (`ARCHAPPL_STORAGE_TOP`, `$HOME/arch`) is unusable when the home directory is not readable by the service account (`0700`, the default on Rocky). The script checks this before the build and suggests another location, for example `--storage=/home/archappl`.
+* Change the default MariaDB passwords with `--db-pass` and `--db-admin-pass` on a production system.
+* On EL systems where the data directory was initialised by the `mysql` system user, `root@localhost` may not exist and every `sudo mysql --user=root` of the `db.*` rules is refused. The `db` stage detects it and recreates `root@localhost` with `unix_socket` authentication through the working socket account.
+* Maven downloads a few large artifacts (`jython-standalone` is 47 MB) and some networks reset those transfers. The `build` stage therefore adds `-Dmaven.wagon.http.retryHandler.count=5`; more options can be passed with `--maven-opts=`.
+* Run the `make` rules from the repository top, **without** `make -C` : `-C` turns on `--print-directory`, and the sub-make started by `scripts/mariadb_setup.bash` then writes its "Entering directory" lines into the path it captures.
+* The whole run is logged into `install_aa.log`.
+
 ## Debian 12 Setup Guide
 This guide outlines the setup and build process on a Debian 12 system.
 
