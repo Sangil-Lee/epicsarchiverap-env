@@ -1,34 +1,81 @@
 #!/usr/bin/env bash
 #
-#  install_aa.sh : Automated installer for the EPICS Archiver Appliance
-#                  (MAVEN build environment, this repository)
+#  install_offline_aa.sh : Offline installer for the EPICS Archiver Appliance
+#                          (MAVEN build environment)
 #
-#  Supported OS  : Debian 11/12/13 and Ubuntu derivatives
-#                  Rocky / AlmaLinux / RHEL / CentOS Stream 8, 9, 10
+#  Supported OS : Debian 11/12/13 and Ubuntu derivatives
+#                 Rocky / AlmaLinux / RHEL / CentOS Stream 8, 9, 10
 #
-#  The script does nothing new : it automates the manual steps described in
-#  README.md and docs/README.rocky8.md by generating the configure/*.local
-#  files and by driving the existing make rules of this repository.
+#  The installation is done in two steps.
+#
+#  1. on a machine which has internet access
+#
+#         ./install_offline_aa.sh bundle --bundle-dir=aa-bundle
+#
+#     downloads everything the installation needs into one directory and
+#     packs it :
+#
+#         aa-bundle/manifest.txt   distribution, versions, commits
+#         aa-bundle/env/           make rules, site templates, pom.xml
+#         aa-bundle/src/           appliance source, a shallow git clone
+#         aa-bundle/m2/            every Maven artifact of a real build
+#         aa-bundle/tarballs/      Tomcat, Maven, optionally a Temurin JDK
+#         aa-bundle/pkgs/          the OS packages and their dependencies
+#
+#  2. on the machine without internet access
+#
+#         ./install_offline_aa.sh --bundle=aa-bundle.tar.gz -y
+#
+#  The OS packages of the bundle only fit a machine running the same
+#  distribution, major version and architecture as the machine which built
+#  it. The manifest records all three and the installation stops on a
+#  mismatch, unless --force-os is given.
+#
+#  The Sphinx documentation needs pip and a network, so the offline
+#  installation always builds with -Dsphinx.skip=true.
 #
 #  version : 0.1.0
 #
 set -euo pipefail
 
-declare -g SC_SCRIPT SC_NAME TOP
+declare -g SC_SCRIPT SC_NAME SC_DIR ENV_TOP
 SC_SCRIPT="$(realpath "${BASH_SOURCE[0]:-$0}")"
 SC_NAME="${SC_SCRIPT##*/}"
-TOP="${SC_SCRIPT%/*}"
+SC_DIR="${SC_SCRIPT%/*}"
+## Where the build environment lives, set by resolve_env_top()
+ENV_TOP=""
 
 ## ----------------------------------------------------------------------------
 ## Defaults, all of them can be changed through the command line options
 ## ----------------------------------------------------------------------------
+## 'env'  unpacks the build environment, everything else needs it.
 ## 'src' comes before 'db' : sql.fill fills the tables from the SQL file which
 ## lives in the appliance source tree, so the clone has to exist first.
-ALL_STAGES=(pkgs java src db tomcat build install service verify)
+ALL_STAGES=(env pkgs java src db tomcat build install service verify)
 ## Stages which are never part of a default run
-EXTRA_STAGES=(paths exist status uninstall)
+EXTRA_STAGES=(bundle paths exist status uninstall)
 ## Stages which only read the system, they never need sudo
 NOSUDO_STAGES=(paths exist status)
+
+## Bundle : created by the 'bundle' stage, consumed by every other one
+BUNDLE=""                        # --bundle=DIR|TARBALL , the bundle to install from
+BUNDLE_DIR="aa-bundle"           # --bundle-dir=DIR , where 'bundle' writes
+BUNDLE_WORK=""                   # extracted bundle, set by open_bundle()
+BUNDLE_TMP=""                    # temporary extraction directory to clean up
+BUNDLE_VERSION="1"               # bundle layout version, recorded in the manifest
+WITH_PKGS="true"                 # --no-pkgs   : do not put the OS packages in the bundle
+WITH_JDK="true"                  # --with-jdk=no : do not put a Temurin JDK in the bundle
+FORCE_OS="false"                 # --force-os  : install a bundle built on another distribution
+BUNDLE_PACK="true"               # --no-pack   : leave the bundle unpacked, do not make the tarball
+
+## Build environment repository : the make rules, the site templates, pom.xml
+ENV_REPO="https://github.com/Sangil-Lee/epicsarchiverap-env"
+ENV_REF="maven"                  # branch, tag or commit of ENV_REPO
+ENV_DIR="/opt/aa-env"            # where it is checked out, owned by the caller
+ENV_UPDATE="false"               # true : always refresh an existing checkout
+
+## Appliance source repository, written into configure/RELEASE.local
+SRC_URL=""                       # empty : keep the configure/RELEASE default
 
 JAVA_MODE="auto"                 # auto | pkg | tarball
 JDK_MAJOR="21"
@@ -59,7 +106,8 @@ SKIP_DOCS="false"                # true : mvn package -Dsphinx.skip=true  (make 
 OPEN_FIREWALL="false"
 ASSUME_YES="false"
 DRY_RUN="false"
-LOG_FILE="${TOP}/install_aa.log"
+## the environment directory does not exist yet when the log is opened
+LOG_FILE="${HOME}/install_full_aa.log"
 
 ## Ports used by the appliance, see configure/CONFIG_VARS
 AA_PORTS=(17665 17666 17667 17668)
@@ -132,9 +180,21 @@ function run_sh { try_sh "$*" || die "command failed : $*"; }
 ## 'cd' instead of 'make -C' on purpose : -C turns on --print-directory, which
 ## the sub-make started by scripts/mariadb_setup.bash inherits, and its
 ## "Entering directory" lines then end up inside the captured path.
-function try_mk   { ( cd "${TOP}" && try make "$@" ); }
+## The build environment may not be there yet : during a --dry-run it is never
+## fetched, so make is only announced and every variable reads back empty.
+function try_mk
+{
+    if [[ ! -d "${ENV_TOP}" ]]; then
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            printf '%s[dry]%s make %s   (in %s)\n' "${C_YEL}" "${C_OFF}" "$*" "${ENV_TOP}"
+            return 0
+        fi
+        die "the build environment ${ENV_TOP} does not exist"
+    fi
+    ( cd "${ENV_TOP}" && try make "$@" )
+}
 function mk       { try_mk "$@" || die "make $* failed"; }
-function make_var { ( cd "${TOP}" && make -s "print-$1" 2>/dev/null | tail -1 ); }
+function make_var { [[ -d "${ENV_TOP}" ]] || return 0; ( cd "${ENV_TOP}" && make -s "print-$1" 2>/dev/null | tail -1 ); }
 
 function ask_yes
 {
@@ -153,11 +213,32 @@ function usage
 
 Usage : ${SC_NAME} [OPTIONS] [STAGE ...]
 
-  Automated installation of the EPICS Archiver Appliance (MAVEN environment)
+  Offline installation of the EPICS Archiver Appliance (MAVEN environment)
   on the Debian and the Rocky / RHEL family of Linux distributions.
+
+  Step 1, on a machine with internet access :
+
+      ./${SC_NAME} bundle --bundle-dir=aa-bundle
+
+  collects everything into aa-bundle/ and packs aa-bundle.tar.gz :
+  the build environment, the appliance source as a git repository, every
+  Maven artifact of a real build, the Tomcat / Maven / JDK tarballs and the
+  OS packages with their dependencies.
+
+  Step 2, on the machine without internet access :
+
+      ./${SC_NAME} --bundle=aa-bundle.tar.gz -y --storage=/home/archappl
+
+  The bundled OS packages only fit a machine running the same distribution,
+  major version and architecture. The manifest records all three and the
+  installation stops on a mismatch unless --force-os is given. The Sphinx
+  documentation always needs a network, so the offline build skips it.
+
+  Without --bundle this script behaves like the online installer.
 
 STAGES (default : all of them, in this order)
 
+  env       Unpack the build environment from the bundle, or fetch it
   pkgs      Install the OS packages : build tools, MariaDB, chrony, ...
   java      Install or detect JDK ${JDK_MAJOR}+ and Apache Maven, generate configure/*.local
   src       Clone the appliance source code            (make init)
@@ -170,6 +251,7 @@ STAGES (default : all of them, in this order)
 
   These ones are never part of a default run :
 
+  bundle    Collect everything an offline machine needs (needs the network)
   paths     Print every path and setting this installation uses  (no sudo)
   exist     Check what is installed and what is missing          (no sudo)
   status    Print the systemd and the appliance service status   (no sudo)
@@ -180,6 +262,25 @@ OPTIONS
   -y, --yes                  Do not ask anything, assume "yes"
   -n, --dry-run              Only print what would be done
       --log-file=FILE        Log file (default : ${LOG_FILE})
+
+      --bundle=PATH          Install from this bundle, a directory or a tar.gz
+      --bundle-dir=DIR       Where the 'bundle' stage writes  (default : ${BUNDLE_DIR})
+      --no-pkgs              Do not put the OS packages in the bundle, the
+                             offline machine installs them from its own mirror
+      --with-jdk=no          Do not put the Temurin JDK in the bundle
+      --no-pack              Leave the bundle unpacked, do not create the tar.gz
+      --force-os             Install a bundle built on another distribution,
+                             its OS packages are then ignored
+
+      --env-repo=URL         Build environment repository
+                             (default : ${ENV_REPO})
+      --env-ref=REF          Its branch, tag or commit    (default : ${ENV_REF})
+      --env-dir=PATH         Where it is checked out      (default : ${ENV_DIR})
+      --env-update           Refresh an existing checkout before installing
+
+      --src-url=URL          Appliance source repository account or URL prefix,
+                             SRC_URL of configure/RELEASE
+      --src-tag=TAG          Its branch, tag or commit, SRC_TAG
 
       --java-mode=MODE       auto | pkg | tarball   (default : ${JAVA_MODE})
                              auto    : reuse an installed JDK ${JDK_MAJOR}+, else the
@@ -201,7 +302,6 @@ OPTIONS
       --db-admin=NAME        SQL admin account   (default : ${DB_ADMIN})
       --db-admin-pass=PASS   SQL admin password  (default : ${DB_ADMIN_PASS})
 
-      --src-tag=TAG          Source branch / tag / hash, written to configure/RELEASE.local
       --ca-addr-list=LIST    EPICS_CA_ADDR_LIST, e.g. "127.0.0.1 10.0.0.255"
       --ca-auto-addr-list=YES|NO
       --maven-opts=OPTS      Extra options for the Maven command line
@@ -212,24 +312,30 @@ OPTIONS
 
 EXAMPLES BY PURPOSE
 
-  The 'make' commands below are run from the repository top,
-  ${TOP}
+  The 'make' commands below are run from the build environment directory,
+  \$(${SC_NAME} paths | grep environment).
   Do not add 'make -C', the scripts called by some rules cannot cope with it.
 
-  Before installing : see what would happen, and where things would go
-    ./${SC_NAME} --dry-run
-    ./${SC_NAME} paths
+  Step 1 : build the bundle, on a machine with internet access
+    ./${SC_NAME} bundle                              # ./aa-bundle + aa-bundle.tar.gz
+    ./${SC_NAME} bundle --bundle-dir=/data/aa-2026-08 --no-pkgs
+    ./${SC_NAME} bundle --env-ref=v1.0 --src-tag=v1.0 --with-jdk=no
+    tar tzf aa-bundle.tar.gz | head            # what is inside
+    cat aa-bundle/manifest.txt                 # distribution, versions, commits
 
-  Install everything
-    ./${SC_NAME}                                     # repository defaults
-    ./${SC_NAME} -y --storage=/home/archappl         # unattended, own storage location
-    ./${SC_NAME} -y --skip-docs --db-pass='S3cret!'  # no Sphinx docs, own DB password
-    ./${SC_NAME} -y --open-firewall --host=10.0.0.5  # reachable from other machines
+  Step 2 : install, on the machine without internet access
+    ./${SC_NAME} --bundle=aa-bundle.tar.gz -y --storage=/home/archappl
+    ./${SC_NAME} --bundle=/mnt/usb/aa-bundle -y       # an unpacked bundle works too
+    ./${SC_NAME} --bundle=aa-bundle.tar.gz --dry-run  # check before touching anything
+    ./${SC_NAME} --bundle=aa-bundle.tar.gz --force-os -y   # OS packages from your mirror
+
+  Install only a part of it from the bundle
+    ./${SC_NAME} --bundle=aa-bundle.tar.gz build install service
+    ./${SC_NAME} --bundle=aa-bundle.tar.gz db          # only the database
 
   Which paths are used : installation, storage, JDK, Tomcat, database, systemd
     ./${SC_NAME} paths
     make vars FILTER=ARCHAPPL
-    make vars FILTER=TOMCAT
     make print-AA_INSTALL_LOCATION                   # one single variable
 
   Is it installed, and is it running ?
@@ -260,7 +366,7 @@ EXAMPLES BY PURPOSE
     ./${SC_NAME} uninstall                           # appliance and systemd unit
     make tomcat.uninstall                            # Tomcat as well
     make db.drop                                     # database and its user
-    rm -f configure/*.local                          # back to the repository defaults
+    rm -f configure/*.local                          # back to the environment defaults
 
 EOF
 }
@@ -287,6 +393,17 @@ function parse_args
             --db-pass=*)           DB_USER_PASS="${1#*=}";   OPT_SET[DB_USER_PASS]=1 ;;
             --db-admin=*)          DB_ADMIN="${1#*=}";       OPT_SET[DB_ADMIN]=1 ;;
             --db-admin-pass=*)     DB_ADMIN_PASS="${1#*=}";  OPT_SET[DB_ADMIN_PASS]=1 ;;
+            --bundle=*)            BUNDLE="${1#*=}" ;;
+            --bundle-dir=*)        BUNDLE_DIR="${1#*=}" ;;
+            --no-pkgs)             WITH_PKGS="false" ;;
+            --with-jdk=*)          [[ "${1#*=}" =~ ^(no|false|0)$ ]] && WITH_JDK="false" || WITH_JDK="true" ;;
+            --no-pack)             BUNDLE_PACK="false" ;;
+            --force-os)            FORCE_OS="true" ;;
+            --env-repo=*)          ENV_REPO="${1#*=}" ;;
+            --env-ref=*)           ENV_REF="${1#*=}" ;;
+            --env-dir=*)           ENV_DIR="${1#*=}"; OPT_SET[ENV_DIR]=1 ;;
+            --env-update)          ENV_UPDATE="true" ;;
+            --src-url=*)           SRC_URL="${1#*=}" ;;
             --src-tag=*)           SRC_TAG="${1#*=}" ;;
             --ca-addr-list=*)      CA_ADDR_LIST="${1#*=}" ;;
             --ca-auto-addr-list=*) CA_AUTO_ADDR_LIST="${1#*=}" ;;
@@ -320,6 +437,17 @@ function parse_args
     done
 }
 
+## true when the run only creates a bundle : it must not touch the configuration
+## of the machine it runs on, the bundle carries its own environment
+function stages_are_bundle_only
+{
+    local stage
+    for stage in "${REQUESTED_STAGES[@]}"; do
+        [[ "${stage}" == "bundle" ]] || return 1
+    done
+    return 0
+}
+
 ## true when every requested stage only reads the system
 function stages_are_read_only
 {
@@ -331,6 +459,501 @@ function stages_are_read_only
         done
         [[ "${found}" == "true" ]] || return 1
     done
+    return 0
+}
+
+## ----------------------------------------------------------------------------
+## Bundle : creation on the online machine, opening on the offline one
+## ----------------------------------------------------------------------------
+function bundle_manifest_value
+{
+    local key="$1"
+    [[ -r "${BUNDLE_WORK}/manifest.txt" ]] || return 0
+    awk -F'=' -v k="${key}" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "${BUNDLE_WORK}/manifest.txt"
+}
+
+## Make the bundle usable : a directory is taken as is, a tarball is extracted
+function open_bundle
+{
+    [[ -n "${BUNDLE}" ]] || return 0
+    [[ -e "${BUNDLE}" ]] || die "the bundle ${BUNDLE} does not exist"
+
+    if [[ -d "${BUNDLE}" ]]; then
+        BUNDLE_WORK="$(realpath "${BUNDLE}")"
+    elif [[ "${DRY_RUN}" == "true" ]]; then
+        ## unpacking hundreds of megabytes to show a plan is pointless : only the
+        ## manifest is read, and the layout it describes is mimicked
+        BUNDLE_TMP="$(mktemp -d)"
+        BUNDLE_WORK="${BUNDLE_TMP}/bundle"
+        mkdir -p "${BUNDLE_WORK}"
+        info "reading the manifest of $(basename "${BUNDLE}")"
+        tar -C "${BUNDLE_WORK}" --strip-components=1 --wildcards -xzf "$(realpath "${BUNDLE}")" '*/manifest.txt' 2>/dev/null \
+            || warn "no manifest could be read from the tarball"
+        mkdir -p "${BUNDLE_WORK}/env" "${BUNDLE_WORK}/m2" "${BUNDLE_WORK}/tarballs"
+        [[ "$(bundle_manifest_value with_pkgs)" == "true" ]] && mkdir -p "${BUNDLE_WORK}/pkgs"
+    else
+        BUNDLE_TMP="$(mktemp -d)"
+        info "extracting $(basename "${BUNDLE}") ..."
+        run_sh "tar -C '${BUNDLE_TMP}' -xzf '$(realpath "${BUNDLE}")'"
+        ## the tarball carries one single top directory
+        BUNDLE_WORK="$(find "${BUNDLE_TMP}" -mindepth 1 -maxdepth 1 -type d | head -1)"
+        [[ -n "${BUNDLE_WORK}" ]] || die "the bundle tarball looks empty"
+    fi
+
+    [[ -r "${BUNDLE_WORK}/manifest.txt" ]] || die "${BUNDLE_WORK} has no manifest.txt, this is not a bundle"
+    ok "bundle : ${BUNDLE_WORK}"
+
+    local b_id b_major b_arch
+    b_id="$(bundle_manifest_value os_id)"
+    b_major="$(bundle_manifest_value os_major)"
+    b_arch="$(bundle_manifest_value arch)"
+    info "built on ${b_id} ${b_major} ${b_arch} at $(bundle_manifest_value created)"
+
+    if [[ -d "${BUNDLE_WORK}/pkgs" ]] && [[ "${b_id}" != "${OS_ID}" || "${b_major}" != "${OS_MAJOR}" || "${b_arch}" != "$(uname -m)" ]]; then
+        error "the bundle carries ${b_id} ${b_major} ${b_arch} packages, this machine is ${OS_ID} ${OS_MAJOR} $(uname -m)"
+        if [[ "${FORCE_OS}" == "true" ]]; then
+            warn "--force-os given, the OS packages of the bundle are ignored"
+            WITH_PKGS="false"
+        else
+            error "rebuild the bundle on a ${OS_ID} ${OS_MAJOR} machine, or install the OS packages"
+            error "from your own mirror and add --force-os"
+            die "the bundle does not fit this machine"
+        fi
+    fi
+    return 0
+}
+
+function close_bundle
+{
+    [[ -n "${BUNDLE_TMP}" && -d "${BUNDLE_TMP}" ]] && rm -rf "${BUNDLE_TMP}"
+    return 0
+}
+
+## --- creation ---------------------------------------------------------------
+## The distribution JDK is only bundled when no Temurin tarball is : on EL,
+## java-N-openjdk-devel pulls the whole graphical stack (libX11, fontconfig,
+## and through it pipewire and gnome pieces), some 46 packages which the
+## appliance never uses and which clash with what a desktop machine already has.
+## 'ant' is left out for the same reason, the Maven build does not use it.
+function bundle_pkg_list
+{
+    if [[ "${OS_FAMILY}" == "debian" ]]; then
+        printf '%s\n' ca-certificates wget curl git sed gawk unzip tar make gcc tree procps \
+                      python3 python3-pip python3-venv \
+                      mariadb-server mariadb-client chrony
+        [[ "${WITH_JDK}" == "true" ]] || printf '%s\n' "openjdk-${JDK_MAJOR}-jdk-headless"
+    else
+        printf '%s\n' ca-certificates wget curl git sed gawk unzip tar make gcc libgcc which tree procps-ng \
+                      python3 python3-pip \
+                      mariadb-server mariadb chrony
+        [[ "${WITH_JDK}" == "true" ]] || printf '%s\n' "java-${JDK_MAJOR}-openjdk-devel"
+    fi
+}
+
+function bundle_packages
+{
+    local dest="$1" pkgs=()
+    mapfile -t pkgs < <(bundle_pkg_list)
+    run mkdir -p "${dest}"
+
+    if [[ "${OS_FAMILY}" == "debian" ]]; then
+        warn "on Debian only the packages which are not installed yet can be downloaded reliably,"
+        warn "build the bundle on a machine which does not have them, or use your own mirror"
+        run mkdir -p "${dest}/partial"
+        try_sh "sudo apt-get install --reinstall --download-only -y -o Dir::Cache::archives='${dest}' ${pkgs[*]}" \
+            || warn "apt-get could not download every package"
+        try_sh "sudo chown -R $(id -un):$(id -gn) '${dest}'" || true
+        rmdir "${dest}/partial" 2>/dev/null || true
+    else
+        ## --alldeps : also fetch the dependencies which are already installed here,
+        ##             the target machine may not have them
+        ## skip_if_unavailable : one broken third party repository must not stop
+        ##             the download of everything else
+        run_sh "dnf download -y --setopt='*.skip_if_unavailable=1' --resolve --alldeps --destdir='${dest}' ${pkgs[*]} < /dev/null"
+    fi
+
+    local n; n="$(find "${dest}" -name '*.rpm' -o -name '*.deb' 2>/dev/null | wc -l)"
+    ok "${n} package files, $(du -sh "${dest}" 2>/dev/null | cut -f1)"
+}
+
+function bundle_tarballs
+{
+    local dest="$1"
+    run mkdir -p "${dest}"
+
+    ## Tomcat, the URL is built by the make rules of the environment
+    local tomcat_url tomcat_src
+    tomcat_url="$(make_var TOMCAT_URL)"; tomcat_url="${tomcat_url//\"/}"
+    tomcat_src="$(make_var TOMCAT_SRC)"
+    if [[ -s "${dest}/${tomcat_src}" ]]; then
+        ok "${tomcat_src} is already in the bundle"
+    else
+        info "downloading ${tomcat_src}"
+        run_sh "curl -fsSL '${tomcat_url}' -o '${dest}/${tomcat_src}'"
+    fi
+
+    ## Maven
+    local maven_src="apache-maven-${MAVEN_VER}-bin.tar.gz"
+    if [[ -s "${dest}/${maven_src}" ]]; then
+        ok "${maven_src} is already in the bundle"
+    else
+        info "downloading ${maven_src}"
+        run_sh "curl -fsSL 'https://archive.apache.org/dist/maven/maven-3/${MAVEN_VER}/binaries/${maven_src}' -o '${dest}/${maven_src}'"
+    fi
+
+    ## Temurin JDK, only used when the target machine has no JDK package
+    if [[ "${WITH_JDK}" == "true" ]]; then
+        local arch
+        case "$(uname -m)" in
+            x86_64)  arch="x64" ;;
+            aarch64) arch="aarch64" ;;
+            *) warn "no Temurin build for $(uname -m), the JDK is not bundled"; arch="" ;;
+        esac
+        if [[ -s "${dest}/temurin-jdk-${JDK_MAJOR}-linux-${arch}.tar.gz" ]]; then
+            ok "the Temurin JDK is already in the bundle"
+        elif [[ -n "${arch}" ]]; then
+            info "downloading the Eclipse Temurin JDK ${JDK_MAJOR} (${arch})"
+            run_sh "curl -fsSL 'https://api.adoptium.net/v3/binary/latest/${JDK_MAJOR}/ga/linux/${arch}/jdk/hotspot/normal/eclipse' -o '${dest}/temurin-jdk-${JDK_MAJOR}-linux-${arch}.tar.gz'"
+        fi
+    fi
+    ok "tarballs : $(du -sh "${dest}" 2>/dev/null | cut -f1)"
+}
+
+## Populate the Maven repository by running a real build : dependency:go-offline
+## misses the plugins which are only resolved while packaging.
+##
+## The build is driven by the make rules of the bundled environment, not by a
+## bare mvn call : conf.archapplproperties generates the site files and
+## copy.sitespecific puts them in src/sitespecific/<siteid>/classpathfiles,
+## which the war plugin needs. ENV_TOP already points at the bundled
+## environment, and the source sits inside it at $(SRC_PATH).
+## The build is a full one, Sphinx included : pom.xml packs ${docs.dir}/docs/build
+## into the mgmt war, and that directory only exists once Sphinx has run. Sphinx
+## needs pip and a network, which the offline machine does not have, so its
+## output travels inside the bundle and the offline build skips Sphinx itself.
+function bundle_maven_repo
+{
+    local dest="$1" src="$2"
+    run mkdir -p "${dest}"
+    info "building once to fill the Maven repository, this takes a few minutes"
+    mk conf.archapplproperties
+    mk build.mvn MAVEN_OPTS="-Dmaven.repo.local=${dest} ${MAVEN_NET_OPTS}"
+    [[ -d "${src}/docs/docs/build" ]] \
+        || warn "${src}/docs/docs/build was not produced, the offline mgmt war will have no documentation"
+    ## the war files are rebuilt on the target, the python virtual environment
+    ## of Sphinx is useless there, but its rendered output is kept
+    run_sh "cd '${src}' && rm -rf target docs/.venv"
+    ok "maven repository : $(du -sh "${dest}" 2>/dev/null | cut -f1)"
+}
+
+function stage_bundle
+{
+    banner "Stage : bundle - collect everything an offline machine needs"
+
+    [[ "${DRY_RUN}" == "true" ]] && { info "would create the bundle in ${BUNDLE_DIR}"; return 0; }
+    command -v git >/dev/null 2>&1 || die "git is required to create a bundle"
+
+    local dest; dest="$(realpath -m "${BUNDLE_DIR}")"
+    if [[ -e "${dest}" && ! -d "${dest}" ]]; then
+        die "${dest} exists and is not a directory"
+    fi
+    ## an interrupted bundle is continued instead of being thrown away : the
+    ## downloads are large and a broken repository or network should not cost
+    ## everything which was already collected
+    [[ -d "${dest}" ]] && info "${dest} exists, the parts which are already complete are kept"
+    run mkdir -p "${dest}"
+
+    ## 1. the build environment
+    if is_env_top "${dest}/env"; then
+        ok "the build environment is already in the bundle"
+    else
+        info "cloning the build environment ${ENV_REPO} (${ENV_REF})"
+        run rm -rf "${dest}/env"
+        try_sh "git clone --depth 1 --branch '${ENV_REF}' '${ENV_REPO}' '${dest}/env'" \
+            || run_sh "git clone '${ENV_REPO}' '${dest}/env' && git -C '${dest}/env' checkout '${ENV_REF}'"
+    fi
+
+    ## the source URL and tag come from the environment which was just cloned
+    local saved_env_top="${ENV_TOP}"
+    ENV_TOP="${dest}/env"
+    [[ -n "${SRC_URL}" || -n "${SRC_TAG}" ]] && write_config_file "${ENV_TOP}/configure/RELEASE.local" \
+"## Generated by ${SC_NAME}
+$( [[ -n "${SRC_URL}" ]] && echo "SRC_URL=${SRC_URL}" )
+$( [[ -n "${SRC_TAG}" ]] && printf 'SRC_TAG:=%s\nSRC_VERSION:=%s\n' "${SRC_TAG}" "${SRC_TAG}" )
+"
+    local src_url src_tag src_path
+    src_url="$(make_var SRC_GITURL)"
+    src_tag="$(make_var SRC_TAG)"
+    src_path="$(make_var SRC_PATH)"
+
+    ## 2. the appliance source, as a git repository : the make rules and the pom
+    ##    read the git history (src_version, RELEASE_NOTES). It is cloned where
+    ##    the make rules expect it, inside the environment.
+    if [[ -d "${ENV_TOP}/${src_path}/.git" ]]; then
+        ok "the appliance source is already in the bundle"
+    else
+        info "cloning the appliance source ${src_url} (${src_tag})"
+        run rm -rf "${ENV_TOP}/${src_path}"
+        try_sh "git clone --depth 1 --branch '${src_tag}' '${src_url}' '${ENV_TOP}/${src_path}'" \
+            || run_sh "git clone '${src_url}' '${ENV_TOP}/${src_path}' && git -C '${ENV_TOP}/${src_path}' checkout '${src_tag}'"
+    fi
+
+    ## 3. the Maven artifacts, from a real build
+    JAVA_HOME_DETECTED="$(find_system_jdk)" || die "a JDK ${JDK_MAJOR}+ is needed to create a bundle, run './${SC_NAME} java' first"
+    MAVEN_HOME_DETECTED="${JAVA_ENV_PREFIX}/MAVEN"
+    [[ -x "${MAVEN_HOME_DETECTED}/bin/mvn" ]] || die "Maven is needed to create a bundle, run './${SC_NAME} java' first"
+    ## the bundled environment must point at the JDK and the Maven of this machine
+    write_local_config
+    ## a reference build which already produced the Sphinx output is not redone
+    if [[ -d "${dest}/m2" && -d "${ENV_TOP}/${src_path}/docs/docs/build" ]]; then
+        ok "the Maven repository is already in the bundle ($(du -sh "${dest}/m2" | cut -f1))"
+    else
+        bundle_maven_repo "${dest}/m2" "${ENV_TOP}/${src_path}"
+    fi
+
+    ## 4. Tomcat, Maven and the JDK tarballs
+    bundle_tarballs "${dest}/tarballs"
+
+    ## 5. the OS packages
+    if [[ "${WITH_PKGS}" == "true" ]]; then
+        bundle_packages "${dest}/pkgs"
+    else
+        info "--no-pkgs : the OS packages are not bundled, the target machine needs its own mirror"
+    fi
+
+    ## 6. the manifest and this installer
+    run cp -f "${SC_SCRIPT}" "${dest}/${SC_NAME}"
+    write_config_file "${dest}/manifest.txt" "\
+bundle_version=${BUNDLE_VERSION}
+created=$(date '+%Y-%m-%d %H:%M:%S %z')
+created_on=$(hostname)
+os_id=${OS_ID}
+os_major=${OS_MAJOR}
+os_pretty=${OS_PRETTY}
+arch=$(uname -m)
+env_repo=${ENV_REPO}
+env_ref=${ENV_REF}
+env_commit=$(git -C "${dest}/env" log --oneline -1 2>/dev/null || echo unknown)
+src_url=${src_url}
+src_tag=${src_tag}
+src_path=${src_path}
+src_commit=$(git -C "${ENV_TOP}/${src_path}" log --oneline -1 2>/dev/null || echo unknown)
+jdk_major=${JDK_MAJOR}
+maven_version=${MAVEN_VER}
+tomcat_version=$(make_var TOMCAT_VER)
+with_pkgs=${WITH_PKGS}
+with_jdk=${WITH_JDK}
+"
+    ENV_TOP="${saved_env_top}"
+
+    ## 7. pack it
+    if [[ "${BUNDLE_PACK}" == "true" ]]; then
+        info "packing ${dest}.tar.gz"
+        run rm -f "${dest}.tar.gz"
+        run_sh "tar -C '$(dirname "${dest}")' -czf '${dest}.tar.gz' '$(basename "${dest}")'"
+        ok "bundle : ${dest}.tar.gz  ($(du -sh "${dest}.tar.gz" | cut -f1))"
+    fi
+
+    printf '\n'
+    print_kv "bundle directory" "${dest}  ($(du -sh "${dest}" | cut -f1))"
+    print_kv "install it with"  "./${SC_NAME} --bundle=${dest}.tar.gz -y --storage=/home/archappl"
+    printf '\n'
+    return 0
+}
+
+## ----------------------------------------------------------------------------
+## Build environment : take it from the bundle, or fetch it
+## ----------------------------------------------------------------------------
+## A directory is a usable build environment when it carries the make rules,
+## the site templates and the pom.xml this installer drives.
+function is_env_top
+{
+    local dir="$1"
+    [[ -r "${dir}/Makefile" && -d "${dir}/configure" && -d "${dir}/site-template" && -r "${dir}/pom.xml" ]]
+}
+
+## https://github.com/owner/repo(.git) -> owner/repo , empty for any other host
+function github_slug
+{
+    local url="${1%.git}"
+    [[ "${url}" =~ ^https?://github\.com/([^/]+)/([^/]+)/?$ ]] || return 1
+    printf '%s/%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+function fetch_env_git
+{
+    command -v git >/dev/null 2>&1 || return 1
+    info "cloning ${ENV_REPO} (${ENV_REF}) into ${ENV_DIR}"
+    try_sh "git clone --branch '${ENV_REF}' '${ENV_REPO}' '${ENV_DIR}'" && return 0
+    ## a commit hash cannot be cloned with --branch
+    try_sh "git clone '${ENV_REPO}' '${ENV_DIR}' && git -C '${ENV_DIR}' checkout '${ENV_REF}'"
+}
+
+function fetch_env_tarball
+{
+    local slug tmp
+    slug="$(github_slug "${ENV_REPO}")" || {
+        warn "${ENV_REPO} is not a github.com URL, the tarball fallback only knows github.com"
+        return 1
+    }
+    info "downloading ${slug} (${ENV_REF}) as a tarball into ${ENV_DIR}"
+    tmp="$(mktemp -d)"
+    try_sh "curl -fsSL 'https://codeload.github.com/${slug}/tar.gz/${ENV_REF}' -o '${tmp}/env.tar.gz'" || {
+        rm -rf "${tmp}"; return 1
+    }
+    try_sh "tar -C '${ENV_DIR}' -xzf '${tmp}/env.tar.gz' --strip-components=1" || { rm -rf "${tmp}"; return 1; }
+    rm -rf "${tmp}"
+    return 0
+}
+
+## Refresh an existing git checkout, a tarball checkout is simply left alone
+function update_env_git
+{
+    [[ -d "${ENV_TOP}/.git" ]] || { warn "${ENV_TOP} is not a git checkout, nothing to update"; return 0; }
+    command -v git >/dev/null 2>&1 || return 0
+    info "updating ${ENV_TOP} to ${ENV_REF}"
+    try_sh "git -C '${ENV_TOP}' fetch --all --tags" || warn "git fetch failed, keeping the current checkout"
+    try_sh "git -C '${ENV_TOP}' checkout '${ENV_REF}'" || warn "cannot check out ${ENV_REF}"
+    try_sh "git -C '${ENV_TOP}' pull --ff-only" || true
+    return 0
+}
+
+## This installer has to work on a bare system : make drives every stage and
+## git or curl is needed to bring the build environment in.
+function ensure_bootstrap_tools
+{
+    [[ "${DRY_RUN}" == "true" ]] && return 0
+    stages_are_read_only && return 0
+
+    local missing=()
+    command -v make >/dev/null 2>&1 || missing+=("make")
+    command -v tar  >/dev/null 2>&1 || missing+=("tar")
+    if ! command -v git >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        missing+=("git" "curl" "ca-certificates")
+    fi
+    (( ${#missing[@]} == 0 )) && return 0
+
+    info "installing the bootstrap tools : ${missing[*]}"
+    if [[ "${OS_FAMILY}" == "debian" ]]; then
+        try sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+    fi
+    pkg_install "${missing[@]}"
+    return 0
+}
+
+## Offline machines may not even have make yet, and it is in the bundle
+function ensure_bundle_bootstrap
+{
+    [[ "${DRY_RUN}" == "true" ]] && return 0
+    stages_are_read_only && return 0
+    command -v make >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && return 0
+
+    [[ -d "${BUNDLE_WORK}/pkgs" && "${WITH_PKGS}" == "true" ]] \
+        || die "'make' is missing and the bundle carries no packages, install make and tar first"
+    info "'make' is missing, installing the packages of the bundle first"
+    pkgs_from_bundle
+    command -v make >/dev/null 2>&1 || die "'make' is still missing after the bundle packages were installed"
+    return 0
+}
+
+## Decide which directory is the build environment and make sure it exists.
+## 1. the directory of this script, when the installer sits inside a checkout
+## 2. --env-dir, when it already carries a checkout
+## 3. otherwise fetch the environment repository into --env-dir
+function resolve_env_top
+{
+    ## A bundle always installs into --env-dir and keeps using it. This is
+    ## checked first and unconditionally : the second call of this function, from
+    ## the 'env' stage, must not fall back to a checkout which happens to sit
+    ## next to the script.
+    if [[ -n "${BUNDLE_WORK}" && -d "${BUNDLE_WORK}/env" ]] && is_env_top "${ENV_DIR}"; then
+        ENV_TOP="${ENV_DIR}"
+        ok "build environment of the bundle : ${ENV_TOP}"
+        return 0
+    fi
+    ## an explicit --env-dir which already holds an environment wins over the
+    ## directory of the script as well
+    if [[ -z "${BUNDLE_WORK}" && -n "${OPT_SET[ENV_DIR]:-}" ]] && is_env_top "${ENV_DIR}"; then
+        ENV_TOP="${ENV_DIR}"
+        ok "build environment : ${ENV_TOP}"
+        [[ "${ENV_UPDATE}" == "true" ]] && update_env_git
+        return 0
+    fi
+
+    ## the bundle carries the environment, copy it into --env-dir
+    if [[ -n "${BUNDLE_WORK}" && -d "${BUNDLE_WORK}/env" ]]; then
+        info "installing the build environment of the bundle into ${ENV_DIR}"
+        if [[ "${DRY_RUN}" != "true" ]]; then
+            if ! mkdir -p "${ENV_DIR}" 2>/dev/null; then
+                run sudo install -d -o "$(id -un)" -g "$(id -gn)" "${ENV_DIR}"
+            fi
+            [[ -w "${ENV_DIR}" ]] || run sudo chown "$(id -un):$(id -gn)" "${ENV_DIR}"
+            run_sh "cp -a '${BUNDLE_WORK}/env/.' '${ENV_DIR}/'"
+        fi
+        ENV_TOP="${ENV_DIR}"
+        ok "build environment ready : ${ENV_TOP}"
+        return 0
+    fi
+
+    if is_env_top "${SC_DIR}"; then
+        ENV_TOP="${SC_DIR}"
+        ok "build environment found next to this script : ${ENV_TOP}"
+        [[ "${ENV_UPDATE}" == "true" ]] && update_env_git
+        return 0
+    fi
+
+    if is_env_top "${ENV_DIR}"; then
+        ENV_TOP="${ENV_DIR}"
+        ok "build environment found : ${ENV_TOP}"
+        [[ "${ENV_UPDATE}" == "true" ]] && update_env_git
+        return 0
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        ENV_TOP="${ENV_DIR}"
+        info "would fetch ${ENV_REPO} (${ENV_REF}) into ${ENV_DIR}"
+        return 0
+    fi
+
+    if stages_are_read_only; then
+        die "no build environment in ${ENV_DIR}, run the installation first or pass --env-dir=PATH"
+    fi
+
+    ## the maven build and the source clone happen here, so the caller has to own it
+    if [[ ! -d "${ENV_DIR}" ]]; then
+        if mkdir -p "${ENV_DIR}" 2>/dev/null; then
+            :
+        else
+            run sudo install -d -o "$(id -un)" -g "$(id -gn)" "${ENV_DIR}"
+        fi
+    fi
+    [[ -w "${ENV_DIR}" ]] || run sudo chown "$(id -un):$(id -gn)" "${ENV_DIR}"
+    ## an empty directory is required, a half filled one is refused
+    if [[ -n "$(ls -A "${ENV_DIR}" 2>/dev/null)" ]]; then
+        die "${ENV_DIR} exists but is not a build environment, empty it or pass --env-dir=PATH"
+    fi
+
+    fetch_env_git || fetch_env_tarball || die "cannot fetch ${ENV_REPO} (${ENV_REF})"
+    is_env_top "${ENV_DIR}" || die "${ENV_DIR} does not look like a build environment after the download"
+    ENV_TOP="${ENV_DIR}"
+    ok "build environment ready : ${ENV_TOP}"
+    return 0
+}
+
+function stage_env
+{
+    banner "Stage : env - build environment (make rules, templates, pom.xml)"
+
+    ENV_UPDATE="true"
+    resolve_env_top
+    print_kv "repository" "${ENV_REPO}"
+    print_kv "reference"  "${ENV_REF}"
+    print_kv "checkout"   "${ENV_TOP}"
+    if [[ -d "${ENV_TOP}/.git" ]] && command -v git >/dev/null 2>&1; then
+        print_kv "commit" "$(git -C "${ENV_TOP}" log --oneline -1 2>/dev/null || echo unknown)"
+    else
+        print_kv "commit" "tarball checkout, no git metadata"
+    fi
     return 0
 }
 
@@ -441,9 +1064,50 @@ function pkg_available
     return 1
 }
 
+## Install the package files carried by the bundle, without touching any repository
+function pkgs_from_bundle
+{
+    local dir="${BUNDLE_WORK}/pkgs"
+    if [[ "${OS_FAMILY}" == "debian" ]]; then
+        compgen -G "${dir}/*.deb" >/dev/null || { warn "no .deb in the bundle, nothing to install"; return 0; }
+        ## dpkg is run twice on purpose : the first pass may leave unconfigured
+        ## packages when the dependency order is not the file order
+        try_sh "sudo dpkg -i ${dir}/*.deb" || try_sh "sudo dpkg -i ${dir}/*.deb" \
+            || die "the packages of the bundle could not be installed"
+        try sudo dpkg --configure -a || true
+    else
+        compgen -G "${dir}/*.rpm" >/dev/null || { warn "no .rpm in the bundle, nothing to install"; return 0; }
+        ## --disablerepo='*' : never reach out to a network repository
+        if ! try_sh "sudo dnf install -y --disablerepo='*' ${dir}/*.rpm"; then
+            error "the packages of the bundle conflict with what this machine already has."
+            error "the bundle is built for a machine at the patch level of the machine which"
+            error "created it. Either bring this machine to that level from its own mirror,"
+            error "or skip the bundled packages and install them yourself :"
+            error "    ./${SC_NAME} --bundle=... --force-os ..."
+            die "the OS packages could not be installed"
+        fi
+    fi
+    ok "the packages of the bundle are installed"
+}
+
 function stage_pkgs
 {
     banner "Stage : pkgs - operating system packages"
+
+    if [[ -n "${BUNDLE_WORK}" ]]; then
+        if [[ "${WITH_PKGS}" == "true" && -d "${BUNDLE_WORK}/pkgs" ]]; then
+            info "installing the OS packages from the bundle"
+            pkgs_from_bundle
+        else
+            warn "the bundle has no OS packages, install them from your own mirror :"
+            warn "    $(bundle_pkg_list | tr '\n' ' ')"
+        fi
+        ## a correct system time is mandatory to archive the signals correctly
+        try sudo systemctl enable --now chronyd >/dev/null 2>&1 \
+            || try sudo systemctl enable --now chrony >/dev/null 2>&1 \
+            || warn "could not enable the NTP service (chrony), please check the system clock yourself"
+        return 0
+    fi
 
     if [[ "${OS_FAMILY}" == "debian" ]]; then
         try sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y \
@@ -575,9 +1239,49 @@ function install_maven_tarball
     ok "Apache Maven ${MAVEN_VER} is installed in ${dest}"
 }
 
+## Unpack a tarball of the bundle into a destination directory
+function untar_bundle_tarball
+{
+    local pattern="$1" dest="$2" file
+    file="$(compgen -G "${BUNDLE_WORK}/tarballs/${pattern}" | head -1)" || return 1
+    [[ -n "${file}" ]] || return 1
+    run sudo install -d "$(dirname "${dest}")"
+    run sudo rm -rf "${dest}"
+    run sudo install -d "${dest}"
+    run_sh "sudo tar -C '${dest}' -xzf '${file}' --strip-components=1"
+    return 0
+}
+
 function stage_java
 {
     banner "Stage : java - JDK ${JDK_MAJOR}+, Apache Maven and Apache Ant"
+
+    if [[ -n "${BUNDLE_WORK}" ]]; then
+        ## the JDK usually comes from the OS packages of the bundle
+        if JAVA_HOME_DETECTED="$(find_system_jdk)"; then
+            ok "JDK ${JDK_MAJOR}+ available : ${JAVA_HOME_DETECTED}"
+        elif untar_bundle_tarball "temurin-jdk-*.tar.gz" "${JAVA_ENV_PREFIX}/JDK"; then
+            ok "the Temurin JDK of the bundle is installed in ${JAVA_ENV_PREFIX}/JDK"
+            JAVA_HOME_DETECTED="$(find_system_jdk)" || die "the bundled JDK does not work"
+        else
+            die "no JDK ${JDK_MAJOR}+ and no JDK in the bundle, rebuild it without --with-jdk=no"
+        fi
+        info "JAVA_HOME  : ${JAVA_HOME_DETECTED}"
+
+        if [[ -x "${JAVA_ENV_PREFIX}/MAVEN/bin/mvn" ]]; then
+            ok "Apache Maven available : ${JAVA_ENV_PREFIX}/MAVEN"
+        else
+            untar_bundle_tarball "apache-maven-*-bin.tar.gz" "${JAVA_ENV_PREFIX}/MAVEN" \
+                || die "no Maven tarball in the bundle"
+            ok "the Maven of the bundle is installed in ${JAVA_ENV_PREFIX}/MAVEN"
+        fi
+        MAVEN_HOME_DETECTED="${JAVA_ENV_PREFIX}/MAVEN"
+
+        [[ -d /usr/share/ant ]] && ANT_HOME_DETECTED="/usr/share/ant" || ANT_HOME_DETECTED=""
+        write_local_config
+        try_mk info.mvn || warn "make info.mvn failed, check the generated configure/*.local files"
+        return 0
+    fi
 
     ## --- JDK ---------------------------------------------------------------
     case "${JAVA_MODE}" in
@@ -679,7 +1383,7 @@ function write_local_config
     local tomcat_location; tomcat_location="$(make_var TOMCAT_INSTALL_LOCATION)"
     [[ -n "${tomcat_location}" ]] || tomcat_location="/opt/tomcat9"
 
-    write_config_file "${TOP}/configure/CONFIG_COMMON.local" "${header}
+    write_config_file "${ENV_TOP}/configure/CONFIG_COMMON.local" "${header}
 TOMCAT_HOME:=${tomcat_location}
 
 DB_NAME:=${DB_NAME}
@@ -691,17 +1395,17 @@ DB_ADMIN_PASS:=${DB_ADMIN_PASS}
 ARCHAPPL_HOST_IPADDR:=${AA_HOST_IPADDR}
 "
 
-    [[ -n "${JAVA_HOME_DETECTED}" ]] && write_config_file "${TOP}/configure/CONFIG_COMMON_JDK.local" "${header}
+    [[ -n "${JAVA_HOME_DETECTED}" ]] && write_config_file "${ENV_TOP}/configure/CONFIG_COMMON_JDK.local" "${header}
 JAVA_HOME:=${JAVA_HOME_DETECTED}
 JAVA_PATH:=${JAVA_HOME_DETECTED}/bin
 "
 
-    [[ -n "${MAVEN_HOME_DETECTED}" ]] && write_config_file "${TOP}/configure/CONFIG_COMMON_MAVEN.local" "${header}
+    [[ -n "${MAVEN_HOME_DETECTED}" ]] && write_config_file "${ENV_TOP}/configure/CONFIG_COMMON_MAVEN.local" "${header}
 MAVEN_HOME:=${MAVEN_HOME_DETECTED}
 MAVEN_PATH:=${MAVEN_HOME_DETECTED}/bin
 "
 
-    [[ -n "${ANT_HOME_DETECTED}" ]] && write_config_file "${TOP}/configure/CONFIG_COMMON_ANT.local" "${header}
+    [[ -n "${ANT_HOME_DETECTED}" ]] && write_config_file "${ENV_TOP}/configure/CONFIG_COMMON_ANT.local" "${header}
 ANT_HOME:=${ANT_HOME_DETECTED}
 ANT_PATH:=${ANT_HOME_DETECTED}/bin
 "
@@ -721,12 +1425,18 @@ ARCHAPPL_MEDIUM_TERM_FOLDER:=${STORAGE_TOP}/mts/ArchiverStore
 ARCHAPPL_LONG_TERM_FOLDER:=${STORAGE_TOP}/lts/ArchiverStore
 "
     fi
-    write_config_file "${TOP}/configure/CONFIG_SITE.local" "${site}"
+    write_config_file "${ENV_TOP}/configure/CONFIG_SITE.local" "${site}"
 
-    [[ -n "${SRC_TAG}" ]] && write_config_file "${TOP}/configure/RELEASE.local" "${header}
-SRC_TAG:=${SRC_TAG}
+    ## appliance source repository and revision
+    if [[ -n "${SRC_TAG}" || -n "${SRC_URL}" ]]; then
+        local release="${header}"
+        [[ -n "${SRC_URL}" ]] && release+="SRC_URL=${SRC_URL}
+"
+        [[ -n "${SRC_TAG}" ]] && release+="SRC_TAG:=${SRC_TAG}
 SRC_VERSION:=${SRC_TAG}
 "
+        write_config_file "${ENV_TOP}/configure/RELEASE.local" "${release}"
+    fi
 
     if [[ -n "${CA_ADDR_LIST}" || -n "${CA_AUTO_ADDR_LIST}" ]]; then
         local epicsenv="${header}"
@@ -734,7 +1444,7 @@ SRC_VERSION:=${SRC_TAG}
 "
         [[ -n "${CA_AUTO_ADDR_LIST}" ]] && epicsenv+="EPICS_CA_AUTO_ADDR_LIST=${CA_AUTO_ADDR_LIST}
 "
-        write_config_file "${TOP}/configure/CONFIG_EPICSENV.local" "${epicsenv}"
+        write_config_file "${ENV_TOP}/configure/CONFIG_EPICSENV.local" "${epicsenv}"
     fi
     return 0
 }
@@ -744,7 +1454,7 @@ SRC_VERSION:=${SRC_TAG}
 ## ----------------------------------------------------------------------------
 function ensure_aa_user
 {
-    run sudo bash "${TOP}/site-template/usergroup.postinst" configure "${AA_USER}" "${AA_USER}"
+    run sudo bash "${ENV_TOP}/site-template/usergroup.postinst" configure "${AA_USER}" "${AA_USER}"
 }
 
 ## Early and cheap advisory check : the service account is usually not a member
@@ -871,6 +1581,15 @@ function stage_tomcat
 
     if [[ -e "${location}/bin/catalina.sh" ]]; then
         ok "Tomcat is already installed in ${location}"
+    elif [[ -n "${BUNDLE_WORK}" ]]; then
+        ## 'make tomcat.get' downloads, so the tarball is put in place by hand
+        ## and only 'make tomcat.install' is used
+        local tomcat_src; tomcat_src="$(make_var TOMCAT_SRC)"
+        [[ -e "${BUNDLE_WORK}/tarballs/${tomcat_src}" ]] \
+            || die "${tomcat_src} is not in the bundle, it was created for another Tomcat version"
+        info "taking ${tomcat_src} from the bundle"
+        run cp -f "${BUNDLE_WORK}/tarballs/${tomcat_src}" "${ENV_TOP}/${tomcat_src}"
+        mk tomcat.install
     else
         mk tomcat.get
         mk tomcat.install
@@ -883,8 +1602,29 @@ function stage_src
     banner "Stage : src - appliance source code"
 
     local src_path; src_path="$(make_var SRC_PATH)"
-    if [[ -d "${TOP}/${src_path}/.git" ]]; then
-        ok "the source code is already cloned into ${TOP}/${src_path}"
+
+    ## The bundle carries the source as a git repository, inside the environment
+    ## it was cloned into : the make rules read its history (src_version) and so
+    ## does the pom (RELEASE_NOTES).
+    if [[ -n "${BUNDLE_WORK}" ]]; then
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            info "would use the appliance source of the bundle, $(bundle_manifest_value src_commit)"
+            mk pom
+            return 0
+        fi
+        if [[ ! -d "${ENV_TOP}/${src_path}" && -d "${BUNDLE_WORK}/src" ]]; then
+            info "copying the appliance source of the bundle into ${ENV_TOP}/${src_path}"
+            run_sh "cp -a '${BUNDLE_WORK}/src' '${ENV_TOP}/${src_path}'"
+        fi
+        [[ -d "${ENV_TOP}/${src_path}" ]] || die "the bundle carries no appliance source"
+        [[ -d "${ENV_TOP}/${src_path}/.git" ]] || warn "the bundled source is not a git repository, 'make install' may fail"
+        ok "appliance source : ${ENV_TOP}/${src_path}  ($(git -C "${ENV_TOP}/${src_path}" log --oneline -1 2>/dev/null || echo 'no git history'))"
+        mk pom
+        return 0
+    fi
+
+    if [[ -d "${ENV_TOP}/${src_path}/.git" ]]; then
+        ok "the source code is already cloned into ${ENV_TOP}/${src_path}"
         [[ -n "${SRC_TAG}" ]] && mk srcupdate
         mk pom
     else
@@ -900,7 +1640,7 @@ function ensure_docs_build_dir
 {
     local src_path docs_build
     src_path="$(make_var SRC_PATH)"
-    docs_build="${TOP}/${src_path}/docs/docs/build"
+    docs_build="${ENV_TOP}/${src_path}/docs/docs/build"
     [[ -d "${docs_build}" ]] && return 0
     warn "no Sphinx output in ${docs_build}, creating it empty :"
     warn "the mgmt web application will have no documentation pages"
@@ -940,6 +1680,27 @@ function stage_build
     ## the repository puts $(MAVEN_OPTS) on the mvn command line, keep what is
     ## already configured there and add the network and the user options
     local mopts; mopts="$(make_var MAVEN_OPTS) ${MAVEN_NET_OPTS} ${MAVEN_USER_OPTS}"
+
+    if [[ -n "${BUNDLE_WORK}" ]]; then
+        [[ -d "${BUNDLE_WORK}/m2" ]] || die "the bundle has no Maven repository, it is incomplete"
+        ## Maven writes into its local repository, so the bundle copy is merged
+        ## into the one of this user instead of being used read only
+        local m2="${HOME}/.m2/repository"
+        info "merging the Maven repository of the bundle into ${m2}"
+        run mkdir -p "${m2}"
+        run_sh "cp -an '${BUNDLE_WORK}/m2/.' '${m2}/' 2>/dev/null || true"
+        ## Offline mode cannot travel through $(MAVEN_OPTS) : make exports its
+        ## command line variables, and the mvn launcher reads the MAVEN_OPTS
+        ## environment variable as JVM options, where -o is not valid. Maven 3.9
+        ## reads its own command line arguments from MAVEN_ARGS instead.
+        mopts="$(make_var MAVEN_OPTS) -Dmaven.repo.local=${m2} ${MAVEN_USER_OPTS}"
+        export MAVEN_ARGS="-o"
+        info "Maven runs offline (MAVEN_ARGS=-o), local repository ${m2}"
+        if [[ "${SKIP_DOCS}" != "true" ]]; then
+            info "the Sphinx documentation needs pip and a network, building with -Dsphinx.skip=true"
+            SKIP_DOCS="true"
+        fi
+    fi
 
     if [[ "${SKIP_DOCS}" == "true" ]]; then
         info "building without the Sphinx documentation (-Dsphinx.skip=true)"
@@ -1055,11 +1816,15 @@ function stage_paths
 
     local storage; storage="${STORAGE_TOP:-$(make_var ARCHAPPL_STORAGE_TOP)}"
 
-    printf '%sInstallation%s\n' "${C_BLU}" "${C_OFF}"
-    print_kv "environment (this repo)" "${TOP}"
+    printf '%sInstaller and build environment%s\n' "${C_BLU}" "${C_OFF}"
+    print_kv "installer"               "${SC_SCRIPT}"
+    print_kv "environment repository"  "${ENV_REPO} (${ENV_REF})"
+    print_kv "environment"             "${ENV_TOP}"
+    print_kv "source repository"       "$(make_var SRC_GITURL)"
+    printf '\n%sInstallation%s\n' "${C_BLU}" "${C_OFF}"
     print_kv "appliance"               "$(make_var AA_INSTALL_LOCATION)"
     print_kv "services"                "$(make_var ARCHAPPL_SERVICES)"
-    print_kv "source code"             "${TOP}/$(make_var SRC_PATH)  ($(make_var SRC_TAG))"
+    print_kv "source code"             "${ENV_TOP}/$(make_var SRC_PATH)  ($(make_var SRC_TAG))"
     print_kv "WAR files"               "$(make_var ARCHAPPL_WARS_TARGET_PATH)"
     print_kv "main script"             "$(make_var AA_INSTALL_LOCATION)/$(make_var ARCHAPPL_MAIN_SCRIPT)"
     printf '\n%sStorage%s\n' "${C_BLU}" "${C_OFF}"
@@ -1082,7 +1847,7 @@ function stage_paths
     print_kv "database user"           "$(make_var DB_USER)"
     printf '\n%sGenerated configuration%s\n' "${C_BLU}" "${C_OFF}"
     local f
-    for f in "${TOP}"/configure/*.local; do
+    for f in "${ENV_TOP}"/configure/*.local; do
         [[ -e "${f}" ]] && print_kv "$(basename "${f}")" "${f}"
     done
     print_kv "install log"             "${LOG_FILE}"
@@ -1098,7 +1863,7 @@ function stage_exist
     jdk="$(make_var JAVA_HOME)"
     mvn="$(make_var MAVEN_HOME)"
     tomcat="$(make_var TOMCAT_HOME)"
-    src="${TOP}/$(make_var SRC_PATH)"
+    src="${ENV_TOP}/$(make_var SRC_PATH)"
     wars="$(make_var ARCHAPPL_WARS_TARGET_PATH)"
     aa="$(make_var AA_INSTALL_LOCATION)"
     unit="$(make_var SYSTEMD_FILENAME)"
@@ -1235,8 +2000,8 @@ ${C_GRN}============================================================
   Useful commands
 
     sudo systemctl status ${unit}
-    cd ${TOP} && make sd_status
-    cd ${TOP} && make vars FILTER=ARCHAPPL
+    cd ${ENV_TOP} && make sd_status
+    cd ${ENV_TOP} && make vars FILTER=ARCHAPPL
     ./${SC_NAME} status
     tail -f ${install_location}/mgmt/logs/archappl_service.log
 
@@ -1254,16 +2019,14 @@ function main
 {
     parse_args "$@"
 
-    : > "${LOG_FILE}" 2>/dev/null || LOG_FILE="/tmp/install_aa.$$.log"
+    : > "${LOG_FILE}" 2>/dev/null || LOG_FILE="/tmp/install_full_aa.$$.log"
     log "### ${SC_NAME} started on $(date) : $*"
 
-    banner "EPICS Archiver Appliance : automated installation"
-    info "repository : ${TOP}"
-    info "stages     : ${REQUESTED_STAGES[*]}"
-    info "log file   : ${LOG_FILE}"
-
-    [[ -r "${TOP}/Makefile" ]] || die "${TOP}/Makefile is missing, run ${SC_NAME} from inside the repository"
-    command -v make >/dev/null 2>&1 || die "'make' is required, install it first : apt-get install make / dnf install make"
+    banner "EPICS Archiver Appliance : standalone installation"
+    info "installer   : ${SC_SCRIPT}"
+    info "environment : ${ENV_REPO} (${ENV_REF})"
+    info "stages      : ${REQUESTED_STAGES[*]}"
+    info "log file    : ${LOG_FILE}"
 
     detect_os
     if stages_are_read_only; then
@@ -1273,9 +2036,27 @@ function main
         selinux_note
     fi
 
+    trap close_bundle EXIT
+    open_bundle
+
+    ## the build environment carries the make rules and the templates, so it has
+    ## to be there before anything else is read or built
+    if stages_are_bundle_only; then
+        ## 'bundle' clones its own environment, this machine is left alone
+        info "creating a bundle only, the configuration of this machine is not touched"
+    else
+        if [[ -n "${BUNDLE_WORK}" ]]; then
+            ensure_bundle_bootstrap
+        else
+            ensure_bootstrap_tools
+        fi
+        resolve_env_top
+    fi
+    command -v make >/dev/null 2>&1 || die "'make' is required, install it first : apt-get install make / dnf install make"
+
     ## Values not given on the command line keep whatever the repository is
     ## currently configured with.
-    seed_defaults_from_make
+    stages_are_bundle_only || seed_defaults_from_make
 
     ## The java stage regenerates the configure/*.local files by itself. When it
     ## is not part of this run, refresh them from what is installed here so that
@@ -1284,7 +2065,7 @@ function main
     for s in "${REQUESTED_STAGES[@]}"; do
         [[ "${s}" == "java" ]] && java_stage="true"
     done
-    if [[ "${java_stage}" == "false" ]] && ! stages_are_read_only; then
+    if [[ "${java_stage}" == "false" ]] && ! stages_are_read_only && ! stages_are_bundle_only; then
         JAVA_HOME_DETECTED="$(make_var JAVA_HOME)"
         [[ -x "${JAVA_HOME_DETECTED}/bin/javac" ]] || JAVA_HOME_DETECTED="$(find_system_jdk || true)"
         MAVEN_HOME_DETECTED="$(make_var MAVEN_HOME)"
@@ -1294,7 +2075,7 @@ function main
         write_local_config
     fi
 
-    stages_are_read_only || warn_storage_early
+    if ! stages_are_read_only && ! stages_are_bundle_only; then warn_storage_early; fi
 
     local stage
     for stage in "${REQUESTED_STAGES[@]}"; do
@@ -1306,6 +2087,7 @@ function main
     ## installation stage, but not after the read only or the uninstall ones
     local summary="false"
     for stage in "${REQUESTED_STAGES[@]}"; do
+        [[ "${stage}" == "env" ]] && continue      # fetching the environment installs nothing
         for s in "${ALL_STAGES[@]}"; do
             [[ "${stage}" == "${s}" ]] && summary="true"
         done

@@ -102,6 +102,52 @@ It adds one stage, `env`, in front of the others, and resolves the environment i
 
 Both installers share the same stages, options and inspection commands, so `paths`, `exist`, `status` and `uninstall` behave identically. The checkout pointed at by `--env-dir` holds the `configure/*.local` files, which means it *is* the configuration state of that installation : keep it around, do not delete it after installing.
 
+### `install_offline_aa.sh`, for machines without internet access
+
+The installation is split in two. On a machine which has internet access :
+
+```bash
+./install_offline_aa.sh bundle --bundle-dir=aa-bundle     # → aa-bundle/ + aa-bundle.tar.gz
+```
+
+then, on the machine without internet access :
+
+```bash
+./install_offline_aa.sh --bundle=aa-bundle.tar.gz -y --storage=/home/archappl
+```
+
+| Bundle | Contents | Size |
+| :--- | :--- | ---: |
+| `env/` | make rules, site templates, `pom.xml`, the appliance source as a shallow git clone, and the rendered Sphinx documentation | 49 MB |
+| `m2/` | every Maven artifact, collected by running a real build | 142 MB |
+| `tarballs/` | Tomcat, Maven and an Eclipse Temurin JDK | 219 MB |
+| `pkgs/` | the OS packages and their dependencies | 171 MB |
+| `manifest.txt` | distribution, version, architecture, commits, versions | |
+
+Things worth knowing before using it :
+
+* The bundled packages fit a machine running the **same distribution, major version and architecture**. The manifest records all three and the installation stops on a mismatch. `--force-os` installs everything else and leaves the OS packages to your own mirror.
+* The appliance source travels as a **git repository**, not as a tarball : `make install` reads `git log` (`src_version`) and `pom.xml` builds its release notes from the history.
+* The Sphinx documentation needs pip and a network, so the bundle carries the **rendered documentation** produced by the reference build and the offline build runs with `-Dsphinx.skip=true`. The resulting mgmt war is identical to an online one.
+* The JDK travels as the Temurin tarball, and the distribution JDK is only bundled with `--with-jdk=no` : on EL, `java-N-openjdk-devel` drags in the whole graphical stack (libX11, fontconfig, and through them pipewire and gnome pieces) which the appliance never uses.
+* Maven runs offline through `MAVEN_ARGS=-o`, never through `MAVEN_OPTS` : make exports its command line variables, and the `mvn` launcher reads `MAVEN_OPTS` as **JVM** options, where `-o` is not valid.
+* An interrupted `bundle` run is resumed, the parts which are already complete are kept.
+
+#### Where the bundle is kept
+
+A bundle is around 500 MB, so it never belongs in this repository : git refuses any file above 100 MiB, and `.gitignore` already excludes `*.tar.gz`. Only the installer scripts are versioned here, the bundle is published next to a tag as a release asset (2 GiB per asset) or copied to an internal file server.
+
+```bash
+# on the machine with internet access
+./install_offline_aa.sh bundle --bundle-dir=aa-bundle-2026-08
+gh release create v2026.08 aa-bundle-2026-08.tar.gz -t "Archiver Appliance offline bundle 2026-08"
+
+# on the machine without internet access, after the file was carried over
+./install_offline_aa.sh --bundle=aa-bundle-2026-08.tar.gz -y --storage=/home/archappl
+```
+
+Keep the bundle which was used for an installation : it pins the environment, the appliance source and every Maven artifact of that machine, so the same version can be rebuilt later without a network.
+
 ## Debian 12 Setup Guide
 This guide outlines the setup and build process on a Debian 12 system.
 

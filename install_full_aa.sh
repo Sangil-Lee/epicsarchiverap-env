@@ -1114,16 +1114,35 @@ function stage_src
     return 0
 }
 
+## pom.xml packs ${docs.dir}/docs/build into the mgmt war, and the war plugin
+## fails when that directory is missing. Sphinx creates it, so skipping Sphinx
+## on a fresh source tree needs the empty directory to exist.
+function ensure_docs_build_dir
+{
+    local src_path docs_build
+    src_path="$(make_var SRC_PATH)"
+    docs_build="${ENV_TOP}/${src_path}/docs/docs/build"
+    [[ -d "${docs_build}" ]] && return 0
+    warn "no Sphinx output in ${docs_build}, creating it empty :"
+    warn "the mgmt web application will have no documentation pages"
+    run mkdir -p "${docs_build}"
+    return 0
+}
+
 ## Tell the user what to do with the Maven failure which just happened
 function diagnose_build_failure
 {
     local tail_log; tail_log="$(tail -300 "${LOG_FILE}" 2>/dev/null)"
     error "the Maven build failed"
-    if grep -qE "Could not transfer artifact|Connection reset|Connection timed out|UnknownHostException|PKIX" <<< "${tail_log}"; then
+    if grep -qE "Unrecognized option|Could not create the Java Virtual Machine" <<< "${tail_log}"; then
+        error "the JVM refused an option : \$(MAVEN_OPTS) of the make rules is also exported"
+        error "as the MAVEN_OPTS environment variable, which the mvn launcher reads as JVM"
+        error "options. Only JVM safe options (-D...) belong in --maven-opts."
+    elif grep -qE "Could not transfer artifact|Connection reset|Connection timed out|UnknownHostException|PKIX" <<< "${tail_log}"; then
         error "Maven could not download every dependency, this is a network or a proxy problem."
         error "the downloads resume where they stopped, so simply run it again :"
         error "    ./${SC_NAME} build install service"
-    elif grep -qiE "sphinx|build_docs" <<< "${tail_log}"; then
+    elif grep -qE "build_docs\.sh|sphinx-build|docs/docs/build" <<< "${tail_log}"; then
         error "the Sphinx documentation build failed, run again without the documentation :"
         error "    ./${SC_NAME} --skip-docs build install service"
     else
@@ -1145,6 +1164,7 @@ function stage_build
 
     if [[ "${SKIP_DOCS}" == "true" ]]; then
         info "building without the Sphinx documentation (-Dsphinx.skip=true)"
+        ensure_docs_build_dir
         mk conf
         try_mk build.mvn2 MAVEN_OPTS="${mopts}" || diagnose_build_failure
     else
