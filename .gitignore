@@ -74,5 +74,6 @@ site-template/*.plist
 # updated.sql was generated through RULES_SQL
 archappl_mysql_updated.sql
 
-# log file of install_aa.sh
+# log files of the installers
 install_aa.log
+install_full_aa.log

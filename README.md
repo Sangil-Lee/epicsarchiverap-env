@@ -76,6 +76,32 @@ Notes
 * Run the `make` rules from the repository top, **without** `make -C` : `-C` turns on `--print-directory`, and the sub-make started by `scripts/mariadb_setup.bash` then writes its "Entering directory" lines into the path it captures.
 * The whole run is logged into `install_aa.log`.
 
+### `install_full_aa.sh`, the standalone variant
+
+`install_full_aa.sh` is the same installer, but it does not need to be run from inside this repository : it carries every stage itself and fetches the build environment (make rules, `site-template/`, `pom.xml`) at run time. It is meant to be kept in a dedicated installer repository, so a machine can be installed with that single file.
+
+```bash
+# One file, a bare machine, nothing else
+curl -fsSLO https://raw.githubusercontent.com/<account>/<installer-repo>/main/install_full_aa.sh
+bash install_full_aa.sh -y --storage=/home/archappl
+
+# Everything from your own account, pinned
+./install_full_aa.sh --env-repo=https://github.com/<account>/epicsarchiverap-env --env-ref=v1.0 \
+                     --src-url=https://github.com/<account> --src-tag=v1.0
+```
+
+| Option | Meaning |
+| :--- | :--- |
+| `--env-repo=URL` | build environment repository (default : `https://github.com/Sangil-Lee/epicsarchiverap-env`) |
+| `--env-ref=REF`  | its branch, tag or commit (default : `maven`) |
+| `--env-dir=PATH` | where it is checked out (default : `/opt/aa-env`, owned by the caller) |
+| `--env-update`   | refresh an existing checkout before installing |
+| `--src-url=URL`  | appliance source repository, `SRC_URL` of `configure/RELEASE` |
+
+It adds one stage, `env`, in front of the others, and resolves the environment in this order : the directory of the script when it already is a checkout, then `--env-dir`, then a fresh `git clone` (a GitHub tarball when git is missing). `make`, `git`/`curl` and `tar` are installed first when the machine does not have them yet, so a minimal system is enough to start.
+
+Both installers share the same stages, options and inspection commands, so `paths`, `exist`, `status` and `uninstall` behave identically. The checkout pointed at by `--env-dir` holds the `configure/*.local` files, which means it *is* the configuration state of that installation : keep it around, do not delete it after installing.
+
 ## Debian 12 Setup Guide
 This guide outlines the setup and build process on a Debian 12 system.
 

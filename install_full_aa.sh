@@ -1,34 +1,57 @@
 #!/usr/bin/env bash
 #
-#  install_aa.sh : Automated installer for the EPICS Archiver Appliance
-#                  (MAVEN build environment, this repository)
+#  install_full_aa.sh : Standalone installer for the EPICS Archiver Appliance
+#                       (MAVEN build environment)
 #
-#  Supported OS  : Debian 11/12/13 and Ubuntu derivatives
-#                  Rocky / AlmaLinux / RHEL / CentOS Stream 8, 9, 10
+#  Supported OS : Debian 11/12/13 and Ubuntu derivatives
+#                 Rocky / AlmaLinux / RHEL / CentOS Stream 8, 9, 10
 #
-#  The script does nothing new : it automates the manual steps described in
-#  README.md and docs/README.rocky8.md by generating the configure/*.local
-#  files and by driving the existing make rules of this repository.
+#  This single file carries the whole installation procedure, so it can live
+#  alone in a dedicated installer repository. What it cannot carry are the
+#  build environment files themselves : the make rules, the site templates
+#  (site-template/siteid alone is 2.5 MB) and the pom.xml. Those are fetched
+#  from the environment repository at run time, with git when it is available
+#  and from a source tarball otherwise.
+#
+#      installer repository            environment repository
+#      install_full_aa.sh      ---->   Makefile, configure/, scripts/,
+#      (this file)                     site-template/, pom.xml
+#                                              |
+#                                              v
+#                                      appliance source repository
+#                                      (SRC_URL/SRC_NAME of configure/RELEASE)
 #
 #  version : 0.1.0
 #
 set -euo pipefail
 
-declare -g SC_SCRIPT SC_NAME TOP
+declare -g SC_SCRIPT SC_NAME SC_DIR ENV_TOP
 SC_SCRIPT="$(realpath "${BASH_SOURCE[0]:-$0}")"
 SC_NAME="${SC_SCRIPT##*/}"
-TOP="${SC_SCRIPT%/*}"
+SC_DIR="${SC_SCRIPT%/*}"
+## Where the build environment lives, set by resolve_env_top()
+ENV_TOP=""
 
 ## ----------------------------------------------------------------------------
 ## Defaults, all of them can be changed through the command line options
 ## ----------------------------------------------------------------------------
+## 'env'  fetches the build environment, everything else needs it.
 ## 'src' comes before 'db' : sql.fill fills the tables from the SQL file which
 ## lives in the appliance source tree, so the clone has to exist first.
-ALL_STAGES=(pkgs java src db tomcat build install service verify)
+ALL_STAGES=(env pkgs java src db tomcat build install service verify)
 ## Stages which are never part of a default run
 EXTRA_STAGES=(paths exist status uninstall)
 ## Stages which only read the system, they never need sudo
 NOSUDO_STAGES=(paths exist status)
+
+## Build environment repository : the make rules, the site templates, pom.xml
+ENV_REPO="https://github.com/Sangil-Lee/epicsarchiverap-env"
+ENV_REF="maven"                  # branch, tag or commit of ENV_REPO
+ENV_DIR="/opt/aa-env"            # where it is checked out, owned by the caller
+ENV_UPDATE="false"               # true : always refresh an existing checkout
+
+## Appliance source repository, written into configure/RELEASE.local
+SRC_URL=""                       # empty : keep the configure/RELEASE default
 
 JAVA_MODE="auto"                 # auto | pkg | tarball
 JDK_MAJOR="21"
@@ -59,7 +82,8 @@ SKIP_DOCS="false"                # true : mvn package -Dsphinx.skip=true  (make 
 OPEN_FIREWALL="false"
 ASSUME_YES="false"
 DRY_RUN="false"
-LOG_FILE="${TOP}/install_aa.log"
+## the environment directory does not exist yet when the log is opened
+LOG_FILE="${HOME}/install_full_aa.log"
 
 ## Ports used by the appliance, see configure/CONFIG_VARS
 AA_PORTS=(17665 17666 17667 17668)
@@ -132,9 +156,21 @@ function run_sh { try_sh "$*" || die "command failed : $*"; }
 ## 'cd' instead of 'make -C' on purpose : -C turns on --print-directory, which
 ## the sub-make started by scripts/mariadb_setup.bash inherits, and its
 ## "Entering directory" lines then end up inside the captured path.
-function try_mk   { ( cd "${TOP}" && try make "$@" ); }
+## The build environment may not be there yet : during a --dry-run it is never
+## fetched, so make is only announced and every variable reads back empty.
+function try_mk
+{
+    if [[ ! -d "${ENV_TOP}" ]]; then
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            printf '%s[dry]%s make %s   (in %s)\n' "${C_YEL}" "${C_OFF}" "$*" "${ENV_TOP}"
+            return 0
+        fi
+        die "the build environment ${ENV_TOP} does not exist"
+    fi
+    ( cd "${ENV_TOP}" && try make "$@" )
+}
 function mk       { try_mk "$@" || die "make $* failed"; }
-function make_var { ( cd "${TOP}" && make -s "print-$1" 2>/dev/null | tail -1 ); }
+function make_var { [[ -d "${ENV_TOP}" ]] || return 0; ( cd "${ENV_TOP}" && make -s "print-$1" 2>/dev/null | tail -1 ); }
 
 function ask_yes
 {
@@ -153,11 +189,18 @@ function usage
 
 Usage : ${SC_NAME} [OPTIONS] [STAGE ...]
 
-  Automated installation of the EPICS Archiver Appliance (MAVEN environment)
+  Standalone installation of the EPICS Archiver Appliance (MAVEN environment)
   on the Debian and the Rocky / RHEL family of Linux distributions.
+
+  This single file carries the installation procedure. The build environment
+  it drives (make rules, site templates, pom.xml) is fetched from
+      ${ENV_REPO} (${ENV_REF})
+  into ${ENV_DIR}, with git when available and from a tarball otherwise.
+  When this script sits inside such a checkout, that checkout is used as is.
 
 STAGES (default : all of them, in this order)
 
+  env       Fetch or update the build environment
   pkgs      Install the OS packages : build tools, MariaDB, chrony, ...
   java      Install or detect JDK ${JDK_MAJOR}+ and Apache Maven, generate configure/*.local
   src       Clone the appliance source code            (make init)
@@ -181,6 +224,16 @@ OPTIONS
   -n, --dry-run              Only print what would be done
       --log-file=FILE        Log file (default : ${LOG_FILE})
 
+      --env-repo=URL         Build environment repository
+                             (default : ${ENV_REPO})
+      --env-ref=REF          Its branch, tag or commit    (default : ${ENV_REF})
+      --env-dir=PATH         Where it is checked out      (default : ${ENV_DIR})
+      --env-update           Refresh an existing checkout before installing
+
+      --src-url=URL          Appliance source repository account or URL prefix,
+                             SRC_URL of configure/RELEASE
+      --src-tag=TAG          Its branch, tag or commit, SRC_TAG
+
       --java-mode=MODE       auto | pkg | tarball   (default : ${JAVA_MODE})
                              auto    : reuse an installed JDK ${JDK_MAJOR}+, else the
                                        distribution package, else the Temurin tarball
@@ -201,7 +254,6 @@ OPTIONS
       --db-admin=NAME        SQL admin account   (default : ${DB_ADMIN})
       --db-admin-pass=PASS   SQL admin password  (default : ${DB_ADMIN_PASS})
 
-      --src-tag=TAG          Source branch / tag / hash, written to configure/RELEASE.local
       --ca-addr-list=LIST    EPICS_CA_ADDR_LIST, e.g. "127.0.0.1 10.0.0.255"
       --ca-auto-addr-list=YES|NO
       --maven-opts=OPTS      Extra options for the Maven command line
@@ -212,24 +264,34 @@ OPTIONS
 
 EXAMPLES BY PURPOSE
 
-  The 'make' commands below are run from the repository top,
-  ${TOP}
+  The 'make' commands below are run from the build environment directory,
+  \$(${SC_NAME} paths | grep environment).
   Do not add 'make -C', the scripts called by some rules cannot cope with it.
+
+  Install a machine from nothing, with this file only
+    curl -fsSLO https://raw.githubusercontent.com/<account>/<installer>/main/${SC_NAME}
+    bash ${SC_NAME} -y --storage=/home/archappl
 
   Before installing : see what would happen, and where things would go
     ./${SC_NAME} --dry-run
     ./${SC_NAME} paths
 
   Install everything
-    ./${SC_NAME}                                     # repository defaults
+    ./${SC_NAME}                                     # defaults, asks nothing but sudo
     ./${SC_NAME} -y --storage=/home/archappl         # unattended, own storage location
     ./${SC_NAME} -y --skip-docs --db-pass='S3cret!'  # no Sphinx docs, own DB password
     ./${SC_NAME} -y --open-firewall --host=10.0.0.5  # reachable from other machines
 
+  Pin what is installed, all from your own account
+    ./${SC_NAME} --env-repo=https://github.com/<account>/epicsarchiverap-env \\
+                 --env-ref=v1.0 \\
+                 --src-url=https://github.com/<account> \\
+                 --src-tag=v1.0
+    ./${SC_NAME} --env-dir=/opt/aa-env --env-update env   # refresh the environment
+
   Which paths are used : installation, storage, JDK, Tomcat, database, systemd
     ./${SC_NAME} paths
     make vars FILTER=ARCHAPPL
-    make vars FILTER=TOMCAT
     make print-AA_INSTALL_LOCATION                   # one single variable
 
   Is it installed, and is it running ?
@@ -260,7 +322,7 @@ EXAMPLES BY PURPOSE
     ./${SC_NAME} uninstall                           # appliance and systemd unit
     make tomcat.uninstall                            # Tomcat as well
     make db.drop                                     # database and its user
-    rm -f configure/*.local                          # back to the repository defaults
+    rm -f configure/*.local                          # back to the environment defaults
 
 EOF
 }
@@ -287,6 +349,11 @@ function parse_args
             --db-pass=*)           DB_USER_PASS="${1#*=}";   OPT_SET[DB_USER_PASS]=1 ;;
             --db-admin=*)          DB_ADMIN="${1#*=}";       OPT_SET[DB_ADMIN]=1 ;;
             --db-admin-pass=*)     DB_ADMIN_PASS="${1#*=}";  OPT_SET[DB_ADMIN_PASS]=1 ;;
+            --env-repo=*)          ENV_REPO="${1#*=}" ;;
+            --env-ref=*)           ENV_REF="${1#*=}" ;;
+            --env-dir=*)           ENV_DIR="${1#*=}" ;;
+            --env-update)          ENV_UPDATE="true" ;;
+            --src-url=*)           SRC_URL="${1#*=}" ;;
             --src-tag=*)           SRC_TAG="${1#*=}" ;;
             --ca-addr-list=*)      CA_ADDR_LIST="${1#*=}" ;;
             --ca-auto-addr-list=*) CA_AUTO_ADDR_LIST="${1#*=}" ;;
@@ -331,6 +398,154 @@ function stages_are_read_only
         done
         [[ "${found}" == "true" ]] || return 1
     done
+    return 0
+}
+
+## ----------------------------------------------------------------------------
+## Build environment : find it, or fetch it from the environment repository
+## ----------------------------------------------------------------------------
+## A directory is a usable build environment when it carries the make rules,
+## the site templates and the pom.xml this installer drives.
+function is_env_top
+{
+    local dir="$1"
+    [[ -r "${dir}/Makefile" && -d "${dir}/configure" && -d "${dir}/site-template" && -r "${dir}/pom.xml" ]]
+}
+
+## https://github.com/owner/repo(.git) -> owner/repo , empty for any other host
+function github_slug
+{
+    local url="${1%.git}"
+    [[ "${url}" =~ ^https?://github\.com/([^/]+)/([^/]+)/?$ ]] || return 1
+    printf '%s/%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+function fetch_env_git
+{
+    command -v git >/dev/null 2>&1 || return 1
+    info "cloning ${ENV_REPO} (${ENV_REF}) into ${ENV_DIR}"
+    try_sh "git clone --branch '${ENV_REF}' '${ENV_REPO}' '${ENV_DIR}'" && return 0
+    ## a commit hash cannot be cloned with --branch
+    try_sh "git clone '${ENV_REPO}' '${ENV_DIR}' && git -C '${ENV_DIR}' checkout '${ENV_REF}'"
+}
+
+function fetch_env_tarball
+{
+    local slug tmp
+    slug="$(github_slug "${ENV_REPO}")" || {
+        warn "${ENV_REPO} is not a github.com URL, the tarball fallback only knows github.com"
+        return 1
+    }
+    info "downloading ${slug} (${ENV_REF}) as a tarball into ${ENV_DIR}"
+    tmp="$(mktemp -d)"
+    try_sh "curl -fsSL 'https://codeload.github.com/${slug}/tar.gz/${ENV_REF}' -o '${tmp}/env.tar.gz'" || {
+        rm -rf "${tmp}"; return 1
+    }
+    try_sh "tar -C '${ENV_DIR}' -xzf '${tmp}/env.tar.gz' --strip-components=1" || { rm -rf "${tmp}"; return 1; }
+    rm -rf "${tmp}"
+    return 0
+}
+
+## Refresh an existing git checkout, a tarball checkout is simply left alone
+function update_env_git
+{
+    [[ -d "${ENV_TOP}/.git" ]] || { warn "${ENV_TOP} is not a git checkout, nothing to update"; return 0; }
+    command -v git >/dev/null 2>&1 || return 0
+    info "updating ${ENV_TOP} to ${ENV_REF}"
+    try_sh "git -C '${ENV_TOP}' fetch --all --tags" || warn "git fetch failed, keeping the current checkout"
+    try_sh "git -C '${ENV_TOP}' checkout '${ENV_REF}'" || warn "cannot check out ${ENV_REF}"
+    try_sh "git -C '${ENV_TOP}' pull --ff-only" || true
+    return 0
+}
+
+## This installer has to work on a bare system : make drives every stage and
+## git or curl is needed to bring the build environment in.
+function ensure_bootstrap_tools
+{
+    [[ "${DRY_RUN}" == "true" ]] && return 0
+    stages_are_read_only && return 0
+
+    local missing=()
+    command -v make >/dev/null 2>&1 || missing+=("make")
+    command -v tar  >/dev/null 2>&1 || missing+=("tar")
+    if ! command -v git >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        missing+=("git" "curl" "ca-certificates")
+    fi
+    (( ${#missing[@]} == 0 )) && return 0
+
+    info "installing the bootstrap tools : ${missing[*]}"
+    if [[ "${OS_FAMILY}" == "debian" ]]; then
+        try sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+    fi
+    pkg_install "${missing[@]}"
+    return 0
+}
+
+## Decide which directory is the build environment and make sure it exists.
+## 1. the directory of this script, when the installer sits inside a checkout
+## 2. --env-dir, when it already carries a checkout
+## 3. otherwise fetch the environment repository into --env-dir
+function resolve_env_top
+{
+    if is_env_top "${SC_DIR}"; then
+        ENV_TOP="${SC_DIR}"
+        ok "build environment found next to this script : ${ENV_TOP}"
+        [[ "${ENV_UPDATE}" == "true" ]] && update_env_git
+        return 0
+    fi
+
+    if is_env_top "${ENV_DIR}"; then
+        ENV_TOP="${ENV_DIR}"
+        ok "build environment found : ${ENV_TOP}"
+        [[ "${ENV_UPDATE}" == "true" ]] && update_env_git
+        return 0
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        ENV_TOP="${ENV_DIR}"
+        info "would fetch ${ENV_REPO} (${ENV_REF}) into ${ENV_DIR}"
+        return 0
+    fi
+
+    if stages_are_read_only; then
+        die "no build environment in ${ENV_DIR}, run the installation first or pass --env-dir=PATH"
+    fi
+
+    ## the maven build and the source clone happen here, so the caller has to own it
+    if [[ ! -d "${ENV_DIR}" ]]; then
+        if mkdir -p "${ENV_DIR}" 2>/dev/null; then
+            :
+        else
+            run sudo install -d -o "$(id -un)" -g "$(id -gn)" "${ENV_DIR}"
+        fi
+    fi
+    [[ -w "${ENV_DIR}" ]] || run sudo chown "$(id -un):$(id -gn)" "${ENV_DIR}"
+    ## an empty directory is required, a half filled one is refused
+    if [[ -n "$(ls -A "${ENV_DIR}" 2>/dev/null)" ]]; then
+        die "${ENV_DIR} exists but is not a build environment, empty it or pass --env-dir=PATH"
+    fi
+
+    fetch_env_git || fetch_env_tarball || die "cannot fetch ${ENV_REPO} (${ENV_REF})"
+    is_env_top "${ENV_DIR}" || die "${ENV_DIR} does not look like a build environment after the download"
+    ENV_TOP="${ENV_DIR}"
+    ok "build environment ready : ${ENV_TOP}"
+    return 0
+}
+
+function stage_env
+{
+    banner "Stage : env - build environment (make rules, templates, pom.xml)"
+
+    ENV_UPDATE="true"
+    resolve_env_top
+    print_kv "repository" "${ENV_REPO}"
+    print_kv "reference"  "${ENV_REF}"
+    print_kv "checkout"   "${ENV_TOP}"
+    if [[ -d "${ENV_TOP}/.git" ]] && command -v git >/dev/null 2>&1; then
+        print_kv "commit" "$(git -C "${ENV_TOP}" log --oneline -1 2>/dev/null || echo unknown)"
+    else
+        print_kv "commit" "tarball checkout, no git metadata"
+    fi
     return 0
 }
 
@@ -679,7 +894,7 @@ function write_local_config
     local tomcat_location; tomcat_location="$(make_var TOMCAT_INSTALL_LOCATION)"
     [[ -n "${tomcat_location}" ]] || tomcat_location="/opt/tomcat9"
 
-    write_config_file "${TOP}/configure/CONFIG_COMMON.local" "${header}
+    write_config_file "${ENV_TOP}/configure/CONFIG_COMMON.local" "${header}
 TOMCAT_HOME:=${tomcat_location}
 
 DB_NAME:=${DB_NAME}
@@ -691,17 +906,17 @@ DB_ADMIN_PASS:=${DB_ADMIN_PASS}
 ARCHAPPL_HOST_IPADDR:=${AA_HOST_IPADDR}
 "
 
-    [[ -n "${JAVA_HOME_DETECTED}" ]] && write_config_file "${TOP}/configure/CONFIG_COMMON_JDK.local" "${header}
+    [[ -n "${JAVA_HOME_DETECTED}" ]] && write_config_file "${ENV_TOP}/configure/CONFIG_COMMON_JDK.local" "${header}
 JAVA_HOME:=${JAVA_HOME_DETECTED}
 JAVA_PATH:=${JAVA_HOME_DETECTED}/bin
 "
 
-    [[ -n "${MAVEN_HOME_DETECTED}" ]] && write_config_file "${TOP}/configure/CONFIG_COMMON_MAVEN.local" "${header}
+    [[ -n "${MAVEN_HOME_DETECTED}" ]] && write_config_file "${ENV_TOP}/configure/CONFIG_COMMON_MAVEN.local" "${header}
 MAVEN_HOME:=${MAVEN_HOME_DETECTED}
 MAVEN_PATH:=${MAVEN_HOME_DETECTED}/bin
 "
 
-    [[ -n "${ANT_HOME_DETECTED}" ]] && write_config_file "${TOP}/configure/CONFIG_COMMON_ANT.local" "${header}
+    [[ -n "${ANT_HOME_DETECTED}" ]] && write_config_file "${ENV_TOP}/configure/CONFIG_COMMON_ANT.local" "${header}
 ANT_HOME:=${ANT_HOME_DETECTED}
 ANT_PATH:=${ANT_HOME_DETECTED}/bin
 "
@@ -721,12 +936,18 @@ ARCHAPPL_MEDIUM_TERM_FOLDER:=${STORAGE_TOP}/mts/ArchiverStore
 ARCHAPPL_LONG_TERM_FOLDER:=${STORAGE_TOP}/lts/ArchiverStore
 "
     fi
-    write_config_file "${TOP}/configure/CONFIG_SITE.local" "${site}"
+    write_config_file "${ENV_TOP}/configure/CONFIG_SITE.local" "${site}"
 
-    [[ -n "${SRC_TAG}" ]] && write_config_file "${TOP}/configure/RELEASE.local" "${header}
-SRC_TAG:=${SRC_TAG}
+    ## appliance source repository and revision
+    if [[ -n "${SRC_TAG}" || -n "${SRC_URL}" ]]; then
+        local release="${header}"
+        [[ -n "${SRC_URL}" ]] && release+="SRC_URL=${SRC_URL}
+"
+        [[ -n "${SRC_TAG}" ]] && release+="SRC_TAG:=${SRC_TAG}
 SRC_VERSION:=${SRC_TAG}
 "
+        write_config_file "${ENV_TOP}/configure/RELEASE.local" "${release}"
+    fi
 
     if [[ -n "${CA_ADDR_LIST}" || -n "${CA_AUTO_ADDR_LIST}" ]]; then
         local epicsenv="${header}"
@@ -734,7 +955,7 @@ SRC_VERSION:=${SRC_TAG}
 "
         [[ -n "${CA_AUTO_ADDR_LIST}" ]] && epicsenv+="EPICS_CA_AUTO_ADDR_LIST=${CA_AUTO_ADDR_LIST}
 "
-        write_config_file "${TOP}/configure/CONFIG_EPICSENV.local" "${epicsenv}"
+        write_config_file "${ENV_TOP}/configure/CONFIG_EPICSENV.local" "${epicsenv}"
     fi
     return 0
 }
@@ -744,7 +965,7 @@ SRC_VERSION:=${SRC_TAG}
 ## ----------------------------------------------------------------------------
 function ensure_aa_user
 {
-    run sudo bash "${TOP}/site-template/usergroup.postinst" configure "${AA_USER}" "${AA_USER}"
+    run sudo bash "${ENV_TOP}/site-template/usergroup.postinst" configure "${AA_USER}" "${AA_USER}"
 }
 
 ## Early and cheap advisory check : the service account is usually not a member
@@ -883,8 +1104,8 @@ function stage_src
     banner "Stage : src - appliance source code"
 
     local src_path; src_path="$(make_var SRC_PATH)"
-    if [[ -d "${TOP}/${src_path}/.git" ]]; then
-        ok "the source code is already cloned into ${TOP}/${src_path}"
+    if [[ -d "${ENV_TOP}/${src_path}/.git" ]]; then
+        ok "the source code is already cloned into ${ENV_TOP}/${src_path}"
         [[ -n "${SRC_TAG}" ]] && mk srcupdate
         mk pom
     else
@@ -1035,11 +1256,15 @@ function stage_paths
 
     local storage; storage="${STORAGE_TOP:-$(make_var ARCHAPPL_STORAGE_TOP)}"
 
-    printf '%sInstallation%s\n' "${C_BLU}" "${C_OFF}"
-    print_kv "environment (this repo)" "${TOP}"
+    printf '%sInstaller and build environment%s\n' "${C_BLU}" "${C_OFF}"
+    print_kv "installer"               "${SC_SCRIPT}"
+    print_kv "environment repository"  "${ENV_REPO} (${ENV_REF})"
+    print_kv "environment"             "${ENV_TOP}"
+    print_kv "source repository"       "$(make_var SRC_GITURL)"
+    printf '\n%sInstallation%s\n' "${C_BLU}" "${C_OFF}"
     print_kv "appliance"               "$(make_var AA_INSTALL_LOCATION)"
     print_kv "services"                "$(make_var ARCHAPPL_SERVICES)"
-    print_kv "source code"             "${TOP}/$(make_var SRC_PATH)  ($(make_var SRC_TAG))"
+    print_kv "source code"             "${ENV_TOP}/$(make_var SRC_PATH)  ($(make_var SRC_TAG))"
     print_kv "WAR files"               "$(make_var ARCHAPPL_WARS_TARGET_PATH)"
     print_kv "main script"             "$(make_var AA_INSTALL_LOCATION)/$(make_var ARCHAPPL_MAIN_SCRIPT)"
     printf '\n%sStorage%s\n' "${C_BLU}" "${C_OFF}"
@@ -1062,7 +1287,7 @@ function stage_paths
     print_kv "database user"           "$(make_var DB_USER)"
     printf '\n%sGenerated configuration%s\n' "${C_BLU}" "${C_OFF}"
     local f
-    for f in "${TOP}"/configure/*.local; do
+    for f in "${ENV_TOP}"/configure/*.local; do
         [[ -e "${f}" ]] && print_kv "$(basename "${f}")" "${f}"
     done
     print_kv "install log"             "${LOG_FILE}"
@@ -1078,7 +1303,7 @@ function stage_exist
     jdk="$(make_var JAVA_HOME)"
     mvn="$(make_var MAVEN_HOME)"
     tomcat="$(make_var TOMCAT_HOME)"
-    src="${TOP}/$(make_var SRC_PATH)"
+    src="${ENV_TOP}/$(make_var SRC_PATH)"
     wars="$(make_var ARCHAPPL_WARS_TARGET_PATH)"
     aa="$(make_var AA_INSTALL_LOCATION)"
     unit="$(make_var SYSTEMD_FILENAME)"
@@ -1215,8 +1440,8 @@ ${C_GRN}============================================================
   Useful commands
 
     sudo systemctl status ${unit}
-    cd ${TOP} && make sd_status
-    cd ${TOP} && make vars FILTER=ARCHAPPL
+    cd ${ENV_TOP} && make sd_status
+    cd ${ENV_TOP} && make vars FILTER=ARCHAPPL
     ./${SC_NAME} status
     tail -f ${install_location}/mgmt/logs/archappl_service.log
 
@@ -1234,16 +1459,14 @@ function main
 {
     parse_args "$@"
 
-    : > "${LOG_FILE}" 2>/dev/null || LOG_FILE="/tmp/install_aa.$$.log"
+    : > "${LOG_FILE}" 2>/dev/null || LOG_FILE="/tmp/install_full_aa.$$.log"
     log "### ${SC_NAME} started on $(date) : $*"
 
-    banner "EPICS Archiver Appliance : automated installation"
-    info "repository : ${TOP}"
-    info "stages     : ${REQUESTED_STAGES[*]}"
-    info "log file   : ${LOG_FILE}"
-
-    [[ -r "${TOP}/Makefile" ]] || die "${TOP}/Makefile is missing, run ${SC_NAME} from inside the repository"
-    command -v make >/dev/null 2>&1 || die "'make' is required, install it first : apt-get install make / dnf install make"
+    banner "EPICS Archiver Appliance : standalone installation"
+    info "installer   : ${SC_SCRIPT}"
+    info "environment : ${ENV_REPO} (${ENV_REF})"
+    info "stages      : ${REQUESTED_STAGES[*]}"
+    info "log file    : ${LOG_FILE}"
 
     detect_os
     if stages_are_read_only; then
@@ -1252,6 +1475,12 @@ function main
         check_sudo
         selinux_note
     fi
+
+    ## the build environment carries the make rules and the templates, so it has
+    ## to be there before anything else is read or built
+    ensure_bootstrap_tools
+    resolve_env_top
+    command -v make >/dev/null 2>&1 || die "'make' is required, install it first : apt-get install make / dnf install make"
 
     ## Values not given on the command line keep whatever the repository is
     ## currently configured with.
@@ -1286,6 +1515,7 @@ function main
     ## installation stage, but not after the read only or the uninstall ones
     local summary="false"
     for stage in "${REQUESTED_STAGES[@]}"; do
+        [[ "${stage}" == "env" ]] && continue      # fetching the environment installs nothing
         for s in "${ALL_STAGES[@]}"; do
             [[ "${stage}" == "${s}" ]] && summary="true"
         done
